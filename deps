@@ -2351,9 +2351,9 @@ def print_master_list(
 
     header = f"{Path(binary_path).name} ({script_type})"
     if is_nested:
-        print(f"\n{STYLE.bold(header)}")
+        print(f"\n{STYLE.bold(header)}  {binary_path}")
     else:
-        print(STYLE.bold(header))
+        print(f"{STYLE.bold(header)}  {binary_path}")
 
     # 2. Collect all entries
     all_entries: List[DepEntry] = []
