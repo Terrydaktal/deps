@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -1367,6 +1368,19 @@ def parse_shell_python_sources(script_path: str) -> Tuple[List[Tuple[str, str]],
     return sources, None, first_interpreter
 
 
+def get_python_package_for_command(interpreter_path: str, command_name: str) -> Optional[str]:
+    """Identify which Python package provides a specific CLI entry point."""
+    rc, stdout, stderr = run_command([
+        interpreter_path, "-c",
+        f"import importlib.metadata; "
+        f"dists = importlib.metadata.distributions(); "
+        f"print(next((d.metadata['Name'] for d in dists if '{command_name}' in (d.read_text('entry_points.txt') or '')), ''))"
+    ])
+    if rc == 0 and stdout.strip():
+        return stdout.strip()
+    return None
+
+
 def resolve_command_by_name(command_name: str) -> Optional[str]:
     found = shutil.which(command_name)
     if found:
@@ -1381,56 +1395,80 @@ def resolve_command_by_name(command_name: str) -> Optional[str]:
 
 def resolve_command_dependency(
     command: str, project_dir: Optional[str] = None
-) -> Tuple[str, Optional[str], Optional[str]]:
+) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
+    # Find local venv if possible for provider mapping
+    venv_python = find_venv_interpreter(Path(project_dir)) if project_dir else None
+
     if os.sep in command or (os.altsep is not None and os.altsep in command):
         path = Path(command)
         if not path.is_absolute() and project_dir:
             path = Path(project_dir) / path
 
         if path.exists() and os.access(path, os.X_OK):
-            return "installed", str(path.resolve()), None
+            provider = None
+            if venv_python and str(path.absolute()).startswith(str(Path(venv_python).parent)):
+                provider = get_python_package_for_command(venv_python, path.name)
+            return "installed", str(path.absolute()), None, provider
 
         alternate = resolve_command_by_name(Path(command).name)
         if alternate:
-            return "expected_missing_present_elsewhere", None, alternate
-        return "missing", None, None
+            return "expected_missing_present_elsewhere", None, alternate, None
+        return "missing", None, None, None
 
     found = resolve_command_by_name(command)
     if found:
-        return "installed", found, None
+        provider = None
+        if venv_python and found.startswith(str(Path(venv_python).parent)):
+            provider = get_python_package_for_command(venv_python, command)
+        return "installed", found, None, provider
 
     # Fallback: check project_dir and common subdirectories for the command name
     if project_dir:
         # 1. Direct in project root
         candidate = Path(project_dir) / command
         if candidate.exists() and os.access(candidate, os.X_OK):
-            return "installed", str(candidate.resolve()), None
+            return "installed", str(candidate.absolute()), None, None
         
         # 2. In common subdirectories
         for sub in ("scripts", "bin", "tools", "libexec"):
             candidate = Path(project_dir) / sub / command
             if candidate.exists() and os.access(candidate, os.X_OK):
-                return "installed", str(candidate.resolve()), None
+                return "installed", str(candidate.absolute()), None, None
 
         # 3. In virtual environment bin
-        venv_python = find_venv_interpreter(Path(project_dir))
         if venv_python:
             venv_bin = Path(venv_python).parent
             candidate = venv_bin / command
             if candidate.exists() and os.access(candidate, os.X_OK):
-                return "installed", str(candidate.resolve()), None
+                provider = get_python_package_for_command(venv_python, command)
+                return "installed", str(candidate.absolute()), None, provider
 
-    return "missing", None, None
+    return "missing", None, None, None
 
 
-def print_script_command_deps(script_path: str) -> Tuple[int, int]:
+@dataclass
+class DepEntry:
+    category: str  # 'sys', 'python module', 'embedded python', 'js package'
+    name: str
+    status: str  # 'INSTALLED', 'MISSING'
+    path: Optional[str]
+    optional: bool = False
+    provider: Optional[str] = None
+    version: Optional[str] = None
+    extra_info: Optional[str] = None
+
+
+def get_script_command_dep_entries(
+    script_path: str,
+) -> Tuple[List[DepEntry], List[str], Optional[str]]:
     commands, scanned_scripts, err = collect_script_command_dependencies(script_path)
     if err:
-        print(f"  {STYLE.red('ERROR')} {err}")
-        return 1, 0
+        return [], scanned_scripts, err
 
     explicit_paths = {
-        command for command in commands if os.sep in command or (os.altsep and os.altsep in command)
+        command
+        for command in commands
+        if os.sep in command or (os.altsep and os.altsep in command)
     }
     explicit_basenames = {Path(command).name for command in explicit_paths}
     filtered_commands = [
@@ -1442,51 +1480,37 @@ def print_script_command_deps(script_path: str) -> Tuple[int, int]:
         )
     ]
 
-    if not filtered_commands:
-        return 0, 0
-
-    # Existence-aware filtering and result collection
-    results: List[Tuple[str, str, str, str]] = []
-    missing = 0
     project_dir = str(Path(script_path).resolve().parent)
+    entries: List[DepEntry] = []
+
     for command in filtered_commands:
-        status, path, alternate = resolve_command_dependency(command, project_dir)
-        
-        # If it's a weak keyword/false-positive candidate and it's missing, ignore it.
-        if status == "missing" and command in POTENTIAL_COMMANDS:
+        status_key, path, alternate, provider = resolve_command_dependency(
+            command, project_dir
+        )
+
+        # Existence-aware filtering for weak candidates
+        if status_key == "missing" and command in POTENTIAL_COMMANDS:
             continue
 
-        if status == "missing":
-            missing += 1
-        elif status == "expected_missing_present_elsewhere":
-            missing += 1
+        status = "INSTALLED" if status_key == "installed" else "MISSING"
+        final_path = path or alternate
         
-        results.append((command, status, path or "", alternate or ""))
+        info = None
+        if status_key == "expected_missing_present_elsewhere":
+            info = f"expected path missing; found elsewhere at {alternate}"
 
-    if not results:
-        return 0, 0
-
-    # Finally print headers and results
-    print(STYLE.bold(f"System dependencies for {script_path}"))
-    print("  INFO target is a script; checking external command dependencies.")
-    if len(scanned_scripts) > 1:
-        preview = ", ".join(Path(item).name for item in scanned_scripts[:4])
-        if len(scanned_scripts) > 4:
-            preview += f", ... (+{len(scanned_scripts) - 4} more)"
-        print(f"  INFO scanned nested scripts: {preview}")
-
-    for command, status, path, alternate in results:
-        if status == "installed":
-            print(f"  {STYLE.green('INSTALLED')} {command} -> {path}")
-        elif status == "expected_missing_present_elsewhere":
-            print(
-                f"  {STYLE.red('MISSING')}   {command} "
-                f"(expected path missing; found elsewhere at {alternate})"
+        entries.append(
+            DepEntry(
+                category="sys",
+                name=command,
+                status=status,
+                path=final_path,
+                provider=provider,
+                extra_info=info,
             )
-        else:
-            print(f"  {STYLE.red('MISSING')}   {command}")
+        )
 
-    return missing, len(results)
+    return entries, scanned_scripts, None
 
 
 def parse_ldd(output: str) -> List[Tuple[str, Optional[str], bool]]:
@@ -2117,6 +2141,181 @@ def print_javascript_deps(project_dir: str, binary_path: Optional[str] = None) -
     return missing, len(required_packages)
 
 
+def get_system_dep_entries(binary_path: str) -> Tuple[List[DepEntry], List[str], Optional[str]]:
+    if has_shebang(binary_path):
+        return get_script_command_dep_entries(binary_path)
+
+    rc, stdout, stderr = run_command(["ldd", binary_path])
+    entries: List[DepEntry] = []
+
+    if rc != 0:
+        stderr_text = stderr.strip()
+        if "not a dynamic executable" in stderr_text:
+            interpreter = resolve_shebang_interpreter(binary_path)
+            if interpreter is None:
+                return [], [], None
+            rc, stdout, stderr = run_command(["ldd", interpreter])
+            if rc != 0:
+                return [], [], f"failed to run ldd on interpreter: {stderr.strip()}"
+        else:
+            return [], [], f"failed to run ldd: {stderr_text}"
+
+    ldd_results = parse_ldd(stdout)
+    for name, dep_path, installed in ldd_results:
+        status = "INSTALLED" if installed else "MISSING"
+        entries.append(DepEntry(category="sys", name=name, status=status, path=dep_path))
+
+    return entries, [], None
+
+
+def get_python_dep_entries(
+    project_dir: str, binary_path: Optional[str] = None
+) -> Tuple[List[DepEntry], List[str], Optional[str], Optional[str]]:
+    scan_target = Path(project_dir)
+    if scan_target.is_file():
+        scan_target = scan_target.parent
+
+    requirements, optional_names, err = get_pipreqs_requirements(str(scan_target))
+    if err:
+        return [], [], err, None
+
+    if requirements is None:
+        return [], [], "unable to resolve requirements", None
+
+    deduped: Dict[str, str] = {}
+    for req_line in requirements:
+        req_name = parse_requirement_name(req_line)
+        if req_name is None:
+            continue
+        deduped.setdefault(canonicalize(req_name), req_line)
+
+    interpreter = None
+    scanned_labels = []
+    category = "python module"
+
+    if binary_path and has_shebang(binary_path) and not is_python_script(binary_path):
+        category = "embedded python"
+        extra_requirements, extra_opt, scanned_labels, extra_err, interpreter = collect_script_python_requirements(binary_path)
+        if extra_err:
+            return [], [], extra_err, interpreter
+        
+        optional_names.update(extra_opt)
+        if extra_requirements:
+            for req_line in extra_requirements:
+                req_name = parse_requirement_name(req_line)
+                if req_name is None:
+                    continue
+                deduped.setdefault(canonicalize(req_name), req_line)
+
+    if interpreter is None:
+        interpreter = find_venv_interpreter(scan_target)
+
+    requirement_lines = list(deduped.values())
+    if not requirement_lines:
+        return [], scanned_labels, None, interpreter
+
+    dist_map = installed_distributions(interpreter)
+    entries: List[DepEntry] = []
+    for req_line in requirement_lines:
+        name = parse_requirement_name(req_line)
+        if not name:
+            continue
+        
+        canon_name = canonicalize(name)
+        is_optional = canon_name in optional_names
+        
+        dist = dist_map.get(canon_name)
+        if dist is None:
+            entries.append(
+                DepEntry(
+                    category=category,
+                    name=req_line,
+                    status="MISSING",
+                    path=None,
+                    optional=is_optional,
+                )
+            )
+        else:
+            location = str(dist.locate_file(""))
+            entries.append(
+                DepEntry(
+                    category=category,
+                    name=req_line,
+                    status="INSTALLED",
+                    path=location,
+                    optional=is_optional,
+                    version=dist.version,
+                )
+            )
+
+    return entries, scanned_labels, None, interpreter
+
+
+def get_javascript_dep_entries(
+    project_dir: str, binary_path: Optional[str] = None
+) -> Tuple[List[DepEntry], List[str], Optional[str]]:
+    scan_target = Path(project_dir).resolve()
+    if scan_target.is_file():
+        scan_target = scan_target.parent
+    
+    required_packages = set()
+    scanned_labels = []
+    if binary_path:
+        pkgs, scanned, err = collect_script_javascript_requirements(binary_path)
+        if err:
+            return [], scanned, err
+        required_packages.update(pkgs)
+        scanned_labels.extend(scanned)
+
+    if not required_packages:
+        return [], scanned_labels, None
+
+    pkg_json_path = find_package_json(scan_target)
+    project_pkgs = {}
+    if pkg_json_path:
+        try:
+            with open(pkg_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                project_pkgs.update(data.get("dependencies", {}))
+                project_pkgs.update(data.get("devDependencies", {}))
+        except Exception:
+            pass
+
+    node_modules_dir = (pkg_json_path.parent / "node_modules") if pkg_json_path else (scan_target / "node_modules")
+    entries: List[DepEntry] = []
+    
+    for pkg in sorted(required_packages):
+        spec = project_pkgs.get(pkg, "*")
+        pkg_dir = node_modules_dir / pkg
+        if pkg_dir.exists() and pkg_dir.is_dir():
+            version = "unknown"
+            try:
+                with open(pkg_dir / "package.json", "r") as f:
+                    version = json.load(f).get("version", "unknown")
+            except Exception:
+                pass
+            entries.append(
+                DepEntry(
+                    category="js package",
+                    name=f"{pkg} ({spec})",
+                    status="INSTALLED",
+                    path=str(pkg_dir),
+                    version=version,
+                )
+            )
+        else:
+            entries.append(
+                DepEntry(
+                    category="js package",
+                    name=f"{pkg} ({spec})",
+                    status="MISSING",
+                    path=None,
+                )
+            )
+
+    return entries, scanned_labels, None
+
+
 def infer_project_target(binary_path: str) -> str:
     if is_script_file(binary_path):
         return binary_path
@@ -2146,12 +2345,117 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def print_master_list(
+    binary_path: str, project_target: str, is_explicit_project: bool
+) -> int:
+    # 1. Detect Script Type for Header
+    script_type = "binary"
+    if is_python_script(binary_path):
+        script_type = "Python script"
+    elif is_javascript_script(binary_path):
+        script_type = "JavaScript script"
+    elif has_shebang(binary_path):
+        script_type = "Bash script"
+
+    print(STYLE.bold(f"{Path(binary_path).name} ({script_type})"))
+
+    # 2. Collect all entries
+    all_entries: List[DepEntry] = []
+    
+    # System / Bash commands
+    sys_entries, scanned_scripts, sys_err = get_system_dep_entries(binary_path)
+    if sys_err:
+        print(f"  {STYLE.red('ERROR')} system deps: {sys_err}")
+    all_entries.extend(sys_entries)
+
+    # Python
+    py_entries = []
+    if is_explicit_project or is_python_script(binary_path):
+        py_entries, scanned_py, py_err, py_interpreter = get_python_dep_entries(project_target, binary_path)
+    else:
+        # Just scan binary for embedded Python (for bash wrappers)
+        # Note: we use get_python_dep_entries with binary_path to trigger embedded logic correctly
+        py_entries, scanned_py, py_err, py_interpreter = get_python_dep_entries(project_target, binary_path)
+    
+    if py_err:
+        print(f"  {STYLE.red('ERROR')} python deps: {py_err}")
+    all_entries.extend(py_entries)
+
+    # JavaScript
+    js_entries, scanned_js, js_err = get_javascript_dep_entries(project_target, binary_path)
+    if js_err:
+        print(f"  {STYLE.red('ERROR')} javascript deps: {js_err}")
+    all_entries.extend(js_entries)
+
+    if not all_entries:
+        if script_type == "Python script":
+            print("  INFO all imported modules are part of the standard library.")
+        elif script_type == "JavaScript script":
+            print("  INFO only built-in Node.js modules used.")
+        else:
+            print("  No dependencies detected.")
+        return 0
+
+    # 3. Print the master list
+    missing_count = 0
+    
+    # Calculate dynamic column widths
+    max_cat_len = 0
+    for entry in all_entries:
+        cat_tag = f"[{entry.category}]"
+        max_cat_len = max(max_cat_len, len(cat_tag))
+    
+    for entry in all_entries:
+        if entry.status == "MISSING" and not entry.optional:
+            missing_count += 1
+
+        cat_tag = f"[{entry.category}]"
+        
+        status_color = STYLE.green if entry.status == "INSTALLED" else (lambda x: STYLE.bold(x) if entry.optional else STYLE.red(x))
+        status_text = entry.status
+        
+        opt_tag = f" {STYLE.bold('(OPTIONAL)')}" if entry.optional else ""
+        prov_tag = f" [via python package: {entry.provider}]" if entry.provider else ""
+        ver_tag = f" (installed: {entry.version})" if entry.version else ""
+        
+        path_part = ""
+        if entry.path:
+            path_part = f" -> {entry.path}"
+
+        # Print with dynamic padding
+        formatted_cat = f"{cat_tag:<{max_cat_len}}"
+        formatted_status = f"{status_color(status_text):<11}" # Status text still needs a bit of fixed space for alignment
+        # Note: status_color returns ANSI codes which mess up length-based padding if we're not careful.
+        # However, status_text itself is fixed length (INSTALLED/MISSING).
+        # We'll use a slightly safer approach for the status column.
+        
+        padding = " " * (10 - len(status_text))
+        print(f"  {formatted_cat} {status_color(status_text)}{padding} {entry.name}{opt_tag}{path_part}{ver_tag}{prov_tag}")
+        
+        if entry.extra_info:
+            print(f"    INFO {entry.extra_info}")
+
+    # 4. Consistency Check (Global)
+    run_consistency_check(project_target)
+
+    # 5. Summary
+    print(STYLE.bold("\nSummary"))
+    sys_total = len([e for e in all_entries if e.category == "sys"])
+    py_total = len([e for e in all_entries if e.category in ("python module", "embedded python")])
+    js_total = len([e for e in all_entries if e.category == "js package"])
+    
+    print(f"  System deps checked: {sys_total}, missing: {len([e for e in all_entries if e.category == 'sys' and e.status == 'MISSING'])}")
+    print(f"  Python deps checked: {py_total}, missing: {len([e for e in all_entries if e.category in ('python module', 'embedded python') and e.status == 'MISSING' and not e.optional])}")
+    print(f"  JavaScript deps checked: {js_total}, missing: {len([e for e in all_entries if e.category == 'js package' and e.status == 'MISSING'])}")
+
+    return 1 if missing_count > 0 else 0
+
+
 def run_consistency_check(project_dir: str) -> None:
     print(STYLE.bold("\nEnvironment Consistency Check"))
     
     uv_path = shutil.which("uv")
     if uv_path:
-        # Check if it's a uv project or just use uv pip check
         rc, stdout, stderr = run_command([uv_path, "pip", "check"])
         if rc == 0:
             print(f"  {STYLE.green('OK')} uv pip check: No broken requirements found.")
@@ -2174,6 +2478,7 @@ def run_consistency_check(project_dir: str) -> None:
         else:
             print("  INFO No pip/uv found for consistency check.")
 
+
 def main() -> int:
     args = parse_args()
     binary_path = resolve_binary(args.binary)
@@ -2183,29 +2488,8 @@ def main() -> int:
         return 1
 
     project_target = args.project if args.project is not None else infer_project_target(binary_path)
-    system_missing, system_total = print_system_deps(binary_path)
-
-    # Only perform a general Python project scan if:
-    # 1. The project was explicitly specified
-    # 2. OR the binary is a Python script (and we infer '.' or its location)
-    # If the binary is a shell script, we ONLY want to scan its internal requirements.
-    if args.project is not None or is_python_script(binary_path):
-        py_missing, py_total = print_python_deps(project_target, binary_path)
-    else:
-        # Scan only the binary itself for embedded Python
-        py_missing, py_total = print_python_deps_only_from_binary(binary_path)
-
-    js_missing, js_total = print_javascript_deps(project_target, binary_path)
-
-    run_consistency_check(str(Path(project_target).resolve()))
-
-    total_missing = system_missing + py_missing + js_missing
-    print(STYLE.bold("\nSummary"))
-    print(f"  System deps checked: {system_total}, missing: {system_missing}")
-    print(f"  Python deps checked: {py_total}, missing: {py_missing}")
-    print(f"  JavaScript deps checked: {js_total}, missing: {js_missing}")
-
-    return 1 if total_missing else 0
+    
+    return print_master_list(binary_path, project_target, args.project is not None)
 
 
 if __name__ == "__main__":
