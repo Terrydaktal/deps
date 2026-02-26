@@ -1,0 +1,2102 @@
+#!/usr/bin/env python3
+import argparse
+import ast
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from importlib import metadata
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+
+class Style:
+    def __init__(self) -> None:
+        self.enabled = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+    def green(self, text: str) -> str:
+        return self._wrap(text, "32")
+
+    def red(self, text: str) -> str:
+        return self._wrap(text, "31")
+
+    def bold(self, text: str) -> str:
+        return self._wrap(text, "1")
+
+    def _wrap(self, text: str, code: str) -> str:
+        if not self.enabled:
+            return text
+        return f"\033[{code}m{text}\033[0m"
+
+
+STYLE = Style()
+WRAPPER_COMMANDS = {"sudo", "env",
+            "git", "command", "nohup", "time", "git"}
+SHELL_KEYWORDS = {
+    "if",
+    "then",
+    "elif",
+    "else",
+    "fi",
+    "for",
+    "while",
+    "until",
+    "do",
+    "done",
+    "case",
+    "esac",
+    "in",
+    "function",
+    "{",
+    "}",
+    "!",
+    "set",
+    "export",
+    "readonly",
+    "local",
+    "declare",
+    "typeset",
+    "source",
+    ".",
+    "alias",
+    "unalias",
+    "eval",
+    "builtin",
+    "exec",
+    "trap",
+    "shift",
+    "break",
+    "continue",
+    "return",
+    "exit",
+    "read",
+    "printf",
+    "echo",
+    "cd",
+    "pushd",
+    "popd",
+    "test",
+    "[",
+    "]]",
+    "true",
+    "false",
+    "type",
+    "hash",
+    "pwd",
+    "wait",
+    "jobs",
+    "fg",
+    "bg",
+    "umask",
+    "END",
+    "next",
+    "cols",
+    "prefix",
+    "proc",
+    "BEGIN",
+    "command",
+    "getopts",
+    "mapfile",
+    "times",
+    "unset",
+    "local",
+    "readonly",
+    "typeset",
+    "declare",
+    "import",
+    "from",
+    "def",
+    "class",
+    "return",
+    "yield",
+    "None",
+    "True",
+    "False",
+    "try",
+    "except",
+    "finally",
+    "async",
+    "await",
+    "BEFORE",
+    "AFTER",
+    "PY",
+    "pdf",
+    "txt",
+    "py",
+    "svg",
+    "xlsx",
+    "docx",
+    "pptx",
+    "csv",
+    "json",
+    "html",
+    "htm",
+    "sqlite",
+    "sqlite3",
+    "db",
+    "db3",
+    "sln",
+    "spec",
+    "plist",
+    "pom",
+    "tpl",
+    "inc",
+    "glsl",
+    "lua",
+    "cs",
+    "ninja",
+    "remote-server",
+    "antiword",
+    "shopt",
+    "sw",
+    "sx",
+    "sy",
+    "x",
+    "y",
+    "current_minor",
+    "rev-list",
+    "symbolic-ref",
+    "fetch",
+    "remote",
+    "show-ref",
+    "rev-parse",
+    "log",
+    "status",
+    "add",
+    "commit",
+    "push",
+    "pull",
+    "diff",
+    "checkout",
+    "branch",
+    "merge",
+    "rebase",
+    "tag",
+    "stash",
+    "config",
+    "clone",
+    "init",
+    "ls-files",
+    "ls-tree",
+}
+SYSTEM_FALLBACK_DIRS = (
+    "/usr/local/sbin",
+    "/usr/sbin",
+    "/sbin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+)
+PYTHON_INTERPRETER_RE = re.compile(r"^(python(\d+(\.\d+)?)?|pypy3?)$")
+JS_INTERPRETER_RE = re.compile(r"^(node(js)?|bun|deno)$")
+ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\[[^]]+\])?\+?=.*$")
+VALID_COMMAND_RE = re.compile(r"^[A-Za-z_./][A-Za-z0-9._/+:-]*$")
+SCRIPT_SUFFIXES = {".py", ".sh", ".bash", ".zsh", ".ksh", ".js", ".mjs", ".cjs"}
+SHELL_VAR_REF_RE = re.compile(r"^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$")
+
+
+def canonicalize(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def run_command(cmd: Sequence[str]) -> Tuple[int, str, str]:
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def resolve_binary(binary: str) -> Optional[str]:
+    bin_path = Path(binary)
+    # Bare command names should resolve from PATH first.
+    if os.sep not in binary and (os.altsep is None or os.altsep not in binary):
+        found = shutil.which(binary)
+        if found:
+            return str(Path(found).absolute())
+        if bin_path.exists():
+            return str(bin_path.absolute())
+        return None
+
+    if bin_path.exists():
+        return str(bin_path.absolute())
+
+    return None
+
+
+def resolve_shebang_interpreter(executable_path: str) -> Optional[str]:
+    try:
+        with open(executable_path, "rb") as handle:
+            first_line = handle.readline(512)
+    except OSError:
+        return None
+
+    if not first_line.startswith(b"#!"):
+        return None
+
+    shebang = first_line[2:].decode("utf-8", "replace").strip()
+    if not shebang:
+        return None
+
+    try:
+        tokens = shlex.split(shebang)
+    except ValueError:
+        tokens = shebang.split()
+
+    if not tokens:
+        return None
+
+    interpreter = tokens[0]
+    if Path(interpreter).name == "env":
+        interpreter = ""
+        for token in tokens[1:]:
+            if token.startswith("-"):
+                continue
+            interpreter = token
+            break
+        if not interpreter:
+            return None
+
+    if os.sep not in interpreter and (os.altsep is None or os.altsep not in interpreter):
+        return shutil.which(interpreter)
+
+    interpreter_path = Path(interpreter)
+    if interpreter_path.exists():
+        return str(interpreter_path.resolve())
+    return None
+
+
+def shebang_command_name(executable_path: str) -> Optional[str]:
+    try:
+        with open(executable_path, "rb") as handle:
+            first_line = handle.readline(512)
+    except OSError:
+        return None
+
+    if not first_line.startswith(b"#!"):
+        return None
+
+    shebang = first_line[2:].decode("utf-8", "replace").strip()
+    if not shebang:
+        return None
+
+    try:
+        tokens = shlex.split(shebang)
+    except ValueError:
+        tokens = shebang.split()
+    if not tokens:
+        return None
+
+    interpreter = tokens[0]
+    if Path(interpreter).name == "env":
+        for token in tokens[1:]:
+            if token.startswith("-"):
+                continue
+            return token
+        return None
+
+    return Path(interpreter).name if os.sep in interpreter else interpreter
+
+
+def is_python_script(path: str) -> bool:
+    try:
+        with open(path, "rb") as handle:
+            first_line = handle.readline(512)
+    except OSError:
+        return False
+    if first_line.startswith(b"#!") and b"python" in first_line.lower():
+        return True
+    return path.endswith(".py")
+
+
+def has_shebang(path: str) -> bool:
+    try:
+        with open(path, "rb") as handle:
+            first_line = handle.readline(512)
+    except OSError:
+        return False
+    return first_line.startswith(b"#!")
+
+
+def is_probably_text_file(path: str) -> bool:
+    try:
+        with open(path, "rb") as handle:
+            sample = handle.read(4096)
+    except OSError:
+        return False
+    return b"\x00" not in sample
+
+
+def is_javascript_script(path: str) -> bool:
+    suffix = Path(path).suffix.lower()
+    if suffix in {".js", ".mjs", ".cjs"}:
+        return True
+    shebang = shebang_command_name(path)
+    if shebang is None:
+        return False
+    return JS_INTERPRETER_RE.match(Path(shebang).name) is not None
+
+
+def is_script_file(path: str) -> bool:
+    file_path = Path(path)
+    if not file_path.exists() or not file_path.is_file():
+        return False
+    if file_path.suffix.lower() in SCRIPT_SUFFIXES:
+        return True
+    return has_shebang(str(file_path))
+
+
+def expand_shell_path_token(script_path: str, token: str) -> str:
+    expanded = token.strip().strip("'\"")
+    script_file = str(Path(script_path).resolve())
+    script_dir = str(Path(script_path).resolve().parent)
+    replacements = {
+        "${SCRIPT_DIR}": script_dir,
+        "$SCRIPT_DIR": script_dir,
+        "${BASH_SOURCE[0]}": script_file,
+        "$0": script_file,
+    }
+    for key, value in replacements.items():
+        expanded = expanded.replace(key, value)
+    if expanded.startswith("~/"):
+        expanded = str(Path.home() / expanded[2:])
+    return expanded
+
+
+def called_name(expr: ast.AST) -> Optional[str]:
+    if isinstance(expr, ast.Name):
+        return expr.id
+    if isinstance(expr, ast.Attribute):
+        base = called_name(expr.value)
+        if base:
+            return f"{base}.{expr.attr}"
+        return expr.attr
+    return None
+
+
+def command_from_token(token: str) -> Optional[str]:
+    token = token.strip()
+    if not token:
+        return None
+    if re.fullmatch(r"\d+(\.\d+)?", token):
+        return None
+    if token.startswith("-") or token in {"|", "||", "&&", ";", "/", "+", "%"}:
+        return None
+    if token.startswith("$"):
+        return None
+    if ASSIGNMENT_RE.match(token):
+        return None
+    # Ignore labels or dictionary keys
+    if token.endswith(":"):
+        return None
+    if any(ch in token for ch in "\\*?[]{}();|&<>`"):
+        return None
+    if not VALID_COMMAND_RE.match(token):
+        return None
+    return token
+
+
+def commands_from_shell_string(command: str) -> Set[str]:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+
+    out: Set[str] = set()
+    first_cmd: Optional[str] = None
+    for token in tokens:
+        candidate = command_from_token(token)
+        if candidate is None:
+            continue
+        first_cmd = candidate
+        break
+
+    if first_cmd is None:
+        return out
+
+    out.add(first_cmd)
+    if first_cmd in WRAPPER_COMMANDS:
+        for token in tokens[1:]:
+            candidate = command_from_token(token)
+            if candidate is not None:
+                out.add(candidate)
+                break
+    return out
+
+
+def shell_split(command: str) -> List[str]:
+    try:
+        return shlex.split(command, comments=True, posix=True)
+    except ValueError:
+        return command.split()
+
+
+def is_assignment_token(token: str) -> bool:
+    return "=" in token and "/" not in token and token.split("=", 1)[0].isidentifier()
+
+
+def unwrap_shell_command_tokens(tokens: Sequence[str]) -> Optional[Tuple[str, int]]:
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+
+        if token in {"for", "select"}:
+            index += 1
+            if index < len(tokens):
+                index += 1
+            continue
+
+        # Wrappers that precede a command or file
+        if token in {
+            "sudo",
+            "command",
+            "nohup",
+            "time",
+            "exec",
+            "builtin",
+            "source",
+            ".",
+            "env",
+            "git",
+        }:
+            if token == "env":
+                index += 1
+                while index < len(tokens) and (
+                    tokens[index].startswith("-") or is_assignment_token(tokens[index])
+                ):
+                    index += 1
+            else:
+                index += 1
+                while index < len(tokens) and tokens[index].startswith("-"):
+                    index += 1
+            continue
+
+        # Structural keywords that we skip to find the next command
+        if token in {
+            "if",
+            "then",
+            "elif",
+            "else",
+            "fi",
+            "while",
+            "until",
+            "do",
+            "done",
+            "case",
+            "esac",
+            "in",
+            "function",
+            "{",
+            "}",
+            "!",
+            "&&",
+            "||",
+            ";",
+        }:
+            index += 1
+            continue
+
+        if is_assignment_token(token):
+            index += 1
+            continue
+
+        if token in SHELL_KEYWORDS:
+            return None
+
+        return token, index
+
+    return None
+
+
+def commands_from_shell_segments(command: str) -> Set[str]:
+    out: Set[str] = set()
+    for segment in command.split("|"):
+        stripped = segment.strip()
+        if not stripped:
+            continue
+        for command_name in commands_from_shell_string(stripped):
+            if command_name not in SHELL_KEYWORDS:
+                out.add(command_name)
+    return out
+
+
+def is_python_interpreter_command(command: str) -> bool:
+    return PYTHON_INTERPRETER_RE.match(Path(command).name) is not None
+
+
+def resolve_shell_reference(script_path: str, token: str) -> Optional[str]:
+    expanded = expand_shell_path_token(script_path, token)
+    if not expanded:
+        return None
+    if "$" in expanded:
+        return None
+    if any(ch in expanded for ch in "*?`|;&<>"):
+        return None
+    if "(" in expanded or ")" in expanded:
+        return None
+
+    candidate = Path(expanded)
+    if not candidate.is_absolute():
+        candidate = Path(script_path).resolve().parent / candidate
+
+    if candidate.exists() and candidate.is_file():
+        # DO NOT call resolve() here, as it follows symlinks to the system python
+        # and loses the venv context. We want the path as it appears in the script.
+        return str(candidate.absolute())
+    return None
+
+
+def extract_shell_assignment_command(script_path: str, value: str) -> Optional[str]:
+    # Strip quotes first so regex and expansion don't have to deal with them
+    value = value.strip().strip("'\"")
+
+    # Handle array assignments like VAR=(cmd args)
+    if value.startswith("(") and value.endswith(")"):
+        value = value[1:-1].strip()
+
+    # Handle ${VAR:-DEFAULT} style patterns common in wrappers
+    sub_match = re.search(r"\$\{?[A-Za-z_][A-Za-z0-9_]*:-(.+?)\}", value)
+    if sub_match:
+        value = sub_match.group(1)
+
+    # Resolve any variables within the value itself before expansion
+    raw = expand_shell_path_token(script_path, value)
+
+    tokens = shell_split(raw)
+    if not tokens:
+        return None
+    first = tokens[0]
+
+    # Try resolving again in case first is relative or has ~/ etc.
+    resolved = resolve_shell_reference(script_path, first)
+    if resolved and os.access(resolved, os.X_OK):
+        return resolved
+
+    cmd = command_from_token(first)
+    if cmd is not None:
+        return cmd
+    return None
+    if not raw:
+        return None
+
+    tokens = shell_split(raw)
+    if not tokens:
+        return None
+    first = tokens[0]
+
+    resolved = resolve_shell_reference(script_path, first)
+    if resolved and os.access(resolved, os.X_OK):
+        return resolved
+
+    cmd = command_from_token(first)
+    if cmd is not None:
+        return cmd
+    return None
+
+
+def resolve_shell_variable_command(
+    script_path: str, token: str, variable_commands: Dict[str, str]
+) -> Optional[str]:
+    raw = token.strip().strip("'\"")
+    match = SHELL_VAR_REF_RE.match(raw)
+    if not match:
+        return None
+
+    name = match.group(1)
+    command = variable_commands.get(name)
+    if command is None:
+        return None
+
+    resolved = resolve_shell_reference(script_path, command)
+    if resolved:
+        return resolved
+    return command
+
+
+def string_values(expr: ast.AST, assigns: Dict[str, ast.AST], depth: int = 0) -> Set[str]:
+    if depth > 8:
+        return set()
+
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return {expr.value}
+    if isinstance(expr, ast.Name):
+        assigned = assigns.get(expr.id)
+        if assigned is None:
+            return set()
+        return string_values(assigned, assigns, depth + 1)
+    if isinstance(expr, ast.BoolOp):
+        out: Set[str] = set()
+        for value in expr.values:
+            out.update(string_values(value, assigns, depth + 1))
+        return out
+    if isinstance(expr, ast.IfExp):
+        return string_values(expr.body, assigns, depth + 1) | string_values(
+            expr.orelse, assigns, depth + 1
+        )
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+        left = string_values(expr.left, assigns, depth + 1)
+        right = string_values(expr.right, assigns, depth + 1)
+        out: Set[str] = set()
+        if left and right and len(left) <= 12 and len(right) <= 12:
+            for l_item in left:
+                for r_item in right:
+                    out.add(l_item + r_item)
+        return out
+    return set()
+
+
+def commands_from_expr(expr: ast.AST, assigns: Dict[str, ast.AST], depth: int = 0) -> Set[str]:
+    if depth > 8:
+        return set()
+
+    if isinstance(expr, ast.Name):
+        assigned = assigns.get(expr.id)
+        if assigned is None:
+            return set()
+        return commands_from_expr(assigned, assigns, depth + 1)
+
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return commands_from_shell_string(expr.value)
+
+    if isinstance(expr, ast.BoolOp):
+        out: Set[str] = set()
+        for value in expr.values:
+            out.update(commands_from_expr(value, assigns, depth + 1))
+        return out
+
+    if isinstance(expr, ast.IfExp):
+        return commands_from_expr(expr.body, assigns, depth + 1) | commands_from_expr(
+            expr.orelse, assigns, depth + 1
+        )
+
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+        return commands_from_expr(expr.left, assigns, depth + 1) | commands_from_expr(
+            expr.right, assigns, depth + 1
+        )
+
+    if isinstance(expr, ast.List) or isinstance(expr, ast.Tuple):
+        out: Set[str] = set()
+        if not expr.elts:
+            return out
+
+        first_candidates: List[str] = []
+        for raw in string_values(expr.elts[0], assigns, depth + 1):
+            cmd = command_from_token(raw)
+            if cmd is not None:
+                first_candidates.append(cmd)
+                out.add(cmd)
+
+        # If wrapped by sudo/env/etc, inspect the next arg as the real command.
+        if first_candidates and any(c in WRAPPER_COMMANDS for c in first_candidates):
+            if len(expr.elts) > 1:
+                for raw in string_values(expr.elts[1], assigns, depth + 1):
+                    cmd = command_from_token(raw)
+                    if cmd is not None:
+                        out.add(cmd)
+        return out
+
+    return set()
+
+
+def parse_python_command_dependencies(script_path: str) -> Tuple[List[str], Optional[str]]:
+    try:
+        source = Path(script_path).read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source, filename=script_path)
+    except OSError as exc:
+        return [], f"failed to read script: {exc}"
+    except SyntaxError as exc:
+        return [], f"failed to parse script: {exc}"
+
+    assigns: Dict[str, ast.AST] = {}
+    commands: Set[str] = set()
+    runner_calls = {
+        "subprocess.run",
+        "subprocess.Popen",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "run_command",
+        "os.system",
+    }
+    dependency_hint_calls = {"shutil.which", "_find_tool_or_common_paths"}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                assigns[node.targets[0].id] = node.value
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.value is not None:
+                assigns[node.target.id] = node.value
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn_name = called_name(node.func)
+        if fn_name is None:
+            continue
+
+        if fn_name in dependency_hint_calls:
+            if node.args:
+                for raw in string_values(node.args[0], assigns):
+                    cmd = command_from_token(raw)
+                    if cmd is not None:
+                        commands.add(cmd)
+            continue
+
+        if fn_name not in runner_calls:
+            continue
+
+        arg_expr: Optional[ast.AST] = node.args[0] if node.args else None
+        if arg_expr is None:
+            for kw in node.keywords:
+                if kw.arg in {"args", "command", "cmd"}:
+                    arg_expr = kw.value
+                    break
+        if arg_expr is None:
+            continue
+
+        commands.update(commands_from_expr(arg_expr, assigns))
+
+    return sorted(commands), None
+
+
+def parse_shell_command_dependencies(script_path: str) -> Tuple[List[str], Optional[str]]:
+    try:
+        source = Path(script_path).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [], f"failed to read script: {exc}"
+
+    commands: Set[str] = set()
+    variable_commands: Dict[str, str] = {}
+    internal_functions: Set[str] = set()
+
+    # Detect local function definitions
+    func_pattern = re.compile(r"^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\{|^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{")
+    for line in source.splitlines():
+        match = func_pattern.match(line)
+        if match:
+            func_name = match.group(1) or match.group(2)
+            if func_name:
+                internal_functions.add(func_name)
+
+    shebang_cmd = shebang_command_name(script_path)
+    if shebang_cmd:
+        commands.add(shebang_cmd)
+
+    heredoc_end: Optional[str] = None
+    heredoc_pattern = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+    subcommand_pattern = re.compile(r"\$\(([^)]*)\)")
+    
+    quote_char: Optional[str] = None
+    
+    lines = source.splitlines()
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+
+        if heredoc_end is not None:
+            if stripped == heredoc_end:
+                heredoc_end = None
+            continue
+
+        if quote_char is not None:
+            # Simple toggle: does this line contain the closing quote?
+            # This is not perfect (escaped quotes, etc) but handles most awk blocks
+            if quote_char in raw_line:
+                # We assume the quote ends here. 
+                # A more robust parser would count quotes, but shell is hard.
+                quote_char = None
+            continue
+
+        if stripped.startswith("#"):
+            continue
+
+        # Check for start of a multi-line quote (like awk '...)
+        # We look for an UNBALANCED quote on this line
+        sq = raw_line.count("'")
+        dq = raw_line.count('"')
+        if sq % 2 != 0:
+            quote_char = "'"
+        elif dq % 2 != 0:
+            quote_char = '"'
+
+        assign_match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.+)$", stripped)
+        if assign_match:
+            var_name = assign_match.group(1)
+            var_value = assign_match.group(2)
+            
+            # If it's an array assignment, scan its contents for commands
+            if var_value.startswith("(") and var_value.endswith(")"):
+                inner = var_value[1:-1].strip()
+                commands.update(commands_from_shell_segments(inner))
+
+            parsed_command = extract_shell_assignment_command(script_path, var_value)
+            if parsed_command:
+                variable_commands[var_name] = parsed_command
+
+        for sub_match in subcommand_pattern.finditer(raw_line):
+            commands.update(commands_from_shell_segments(sub_match.group(1)))
+
+        tokens = shell_split(stripped)
+        
+        # Handle assignments with spaces: VAR = CMD
+        if len(tokens) >= 3 and tokens[1] == "=":
+            # Skip this line as it is an assignment
+            continue
+
+        command_info = unwrap_shell_command_tokens(tokens)
+        if command_info is not None:
+            command, _ = command_info
+            variable_cmd = resolve_shell_variable_command(
+                script_path, command, variable_commands
+            )
+            if variable_cmd is not None:
+                commands.add(variable_cmd)
+            else:
+                cmd = command_from_token(command)
+                if cmd is not None and cmd not in SHELL_KEYWORDS:
+                    commands.add(cmd)
+
+        match = heredoc_pattern.search(raw_line)
+        if match:
+            heredoc_end = match.group(2)
+
+    filtered = {c for c in commands if c not in internal_functions}
+    return sorted(filtered), None
+
+
+def parse_shell_script_references(script_path: str) -> Tuple[List[str], Optional[str]]:
+    try:
+        source = Path(script_path).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [], f"failed to read script: {exc}"
+
+    references: Set[str] = set()
+    heredoc_end: Optional[str] = None
+    heredoc_pattern = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+    inline_script_pattern = re.compile(r"[A-Za-z0-9_./${}-]+\.(?:py|sh|bash|zsh|js|mjs|cjs)\b")
+
+    for raw_line in source.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+
+        if heredoc_end is not None:
+            if stripped == heredoc_end:
+                heredoc_end = None
+            continue
+
+        if stripped.startswith("#"):
+            continue
+
+        match = heredoc_pattern.search(raw_line)
+        command_part = raw_line.split("<<", 1)[0] if match else raw_line
+        tokens = shell_split(command_part)
+        command_info = unwrap_shell_command_tokens(tokens)
+
+        if command_info is not None:
+            _, cmd_index = command_info
+            for candidate in tokens[cmd_index:]:
+                if candidate.startswith("-"):
+                    continue
+                resolved = resolve_shell_reference(script_path, candidate)
+                if resolved and is_script_file(resolved):
+                    references.add(resolved)
+
+        for candidate in inline_script_pattern.findall(command_part):
+            resolved = resolve_shell_reference(script_path, candidate)
+            if resolved and is_script_file(resolved):
+                references.add(resolved)
+
+        if match:
+            heredoc_end = match.group(2)
+
+    return sorted(references), None
+
+
+def parse_js_string_literal(raw: str) -> Optional[str]:
+    if len(raw) < 2:
+        return None
+    if raw[0] not in {"'", '"', "`"} or raw[-1] != raw[0]:
+        return None
+
+    value = raw[1:-1]
+    value = value.replace("\\\\", "\\")
+    value = value.replace("\\n", "\n")
+    value = value.replace("\\t", "\t")
+    value = value.replace('\\"', '"')
+    value = value.replace("\\'", "'")
+    value = value.replace("\\`", "`")
+    return value
+
+
+def resolve_js_reference(js_path: str, token: str, var_paths: Dict[str, str]) -> Optional[str]:
+    candidate = token.strip().strip("'\"")
+    if not candidate:
+        return None
+
+    for name, path in var_paths.items():
+        candidate = candidate.replace(f"${{{name}}}", path)
+
+    candidate = candidate.replace("${__dirname}", str(Path(js_path).resolve().parent))
+    if "$" in candidate:
+        return None
+
+    candidate_path = Path(candidate)
+    if not candidate_path.is_absolute():
+        candidate_path = Path(js_path).resolve().parent / candidate_path
+
+    if candidate_path.exists() and candidate_path.is_file():
+        return str(candidate_path.resolve())
+    return None
+
+
+def extract_js_assignment_maps(js_path: str, source: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+    script_dir = Path(js_path).resolve().parent
+    var_paths: Dict[str, str] = {}
+    var_exprs: Dict[str, str] = {}
+
+    path_assign_pattern = re.compile(
+        r"(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*path\.(?:resolve|join)\(\s*__dirname\s*,\s*['\"]([^'\"]+)['\"]\s*\)"
+    )
+    generic_assign_pattern = re.compile(
+        r"(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*([^;\n]+);"
+    )
+
+    for match in path_assign_pattern.finditer(source):
+        name = match.group(1)
+        rel = match.group(2)
+        var_paths[name] = str((script_dir / rel).resolve())
+
+    for match in generic_assign_pattern.finditer(source):
+        name = match.group(1)
+        expr = match.group(2).strip()
+        var_exprs[name] = expr
+
+    return var_paths, var_exprs
+
+
+def js_literal_candidates(
+    raw_arg: str, var_paths: Dict[str, str], var_exprs: Dict[str, str], depth: int = 0
+) -> List[str]:
+    if depth > 5:
+        return []
+
+    token = raw_arg.strip()
+    literal = parse_js_string_literal(token)
+    if literal is not None:
+        for name, path in var_paths.items():
+            literal = literal.replace(f"${{{name}}}", path)
+        literal = re.sub(r"\$\{[^}]+\}", "", literal)
+        return [literal]
+
+    if re.match(r"^[A-Za-z_]\w*$", token):
+        expr = var_exprs.get(token)
+        if not expr:
+            return []
+        return js_literal_candidates(expr, var_paths, var_exprs, depth + 1)
+
+    literals = re.findall(r"`[^`]*`|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"", token)
+    out: List[str] = []
+    for item in literals:
+        parsed = parse_js_string_literal(item)
+        if parsed is None:
+            continue
+        for name, path in var_paths.items():
+            parsed = parsed.replace(f"${{{name}}}", path)
+        parsed = re.sub(r"\$\{[^}]+\}", "", parsed)
+        out.append(parsed)
+    return out
+
+
+def js_candidates_for_call_argument(
+    raw_arg: str,
+    source: str,
+    call_pos: int,
+    var_paths: Dict[str, str],
+    var_exprs: Dict[str, str],
+) -> List[str]:
+    token = raw_arg.strip()
+    if not re.match(r"^[A-Za-z_]\w*$", token):
+        return js_literal_candidates(token, var_paths, var_exprs)
+
+    pattern = re.compile(
+        rf"(?:const|let|var)\s+{re.escape(token)}\s*=\s*([^;\n]+);"
+    )
+    collected: List[str] = []
+    for match in pattern.finditer(source[:call_pos]):
+        expr = match.group(1).strip()
+        collected.extend(js_literal_candidates(expr, var_paths, var_exprs))
+
+    if not collected:
+        collected.extend(js_literal_candidates(token, var_paths, var_exprs))
+
+    deduped: List[str] = []
+    seen: Set[str] = set()
+    for item in collected:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def extract_js_array_literals(
+    raw_arg: str, var_paths: Dict[str, str], var_exprs: Dict[str, str]
+) -> List[str]:
+    token = raw_arg.strip()
+    if not token:
+        return []
+    if re.match(r"^[A-Za-z_]\w*$", token):
+        expr = var_exprs.get(token)
+        if not expr:
+            return []
+        token = expr.strip()
+
+    literals = re.findall(r"`[^`]*`|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"", token)
+    out: List[str] = []
+    for item in literals:
+        parsed = parse_js_string_literal(item)
+        if parsed is None:
+            continue
+        for name, path in var_paths.items():
+            parsed = parsed.replace(f"${{{name}}}", path)
+        parsed = re.sub(r"\$\{[^}]+\}", "", parsed)
+        out.append(parsed)
+    return out
+
+
+def parse_javascript_command_dependencies(
+    js_path: str,
+) -> Tuple[List[str], List[str], Optional[str]]:
+    try:
+        source = Path(js_path).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [], [], f"failed to read script: {exc}"
+
+    commands: Set[str] = set()
+    script_refs: Set[str] = set()
+
+    shebang_cmd = shebang_command_name(js_path)
+    if shebang_cmd:
+        commands.add(Path(shebang_cmd).name)
+
+    var_paths, var_exprs = extract_js_assignment_maps(js_path, source)
+
+    exec_pattern = re.compile(
+        r"\b(execSync|exec)\s*\(\s*([A-Za-z_]\w*|`[^`]*`|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")"
+    )
+    spawn_pattern = re.compile(
+        r"\b(spawnSync|spawn|execFileSync|execFile)\s*\(\s*([A-Za-z_]\w*|`[^`]*`|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")\s*(?:,\s*(\[[^\]]*\]|[A-Za-z_]\w*))?"
+    )
+
+    for match in exec_pattern.finditer(source):
+        raw_arg = match.group(2)
+        call_pos = match.start()
+        for command_text in js_candidates_for_call_argument(
+            raw_arg, source, call_pos, var_paths, var_exprs
+        ):
+            for command in commands_from_shell_string(command_text):
+                commands.add(command)
+
+            for token in shell_split(command_text):
+                resolved = resolve_js_reference(js_path, token, var_paths)
+                if resolved and is_script_file(resolved):
+                    script_refs.add(resolved)
+
+    for match in spawn_pattern.finditer(source):
+        raw_command = match.group(2)
+        raw_args = match.group(3) or ""
+        call_pos = match.start()
+
+        candidates = js_candidates_for_call_argument(
+            raw_command, source, call_pos, var_paths, var_exprs
+        )
+        for candidate in candidates:
+            first = None
+            for token in shell_split(candidate):
+                parsed = command_from_token(token)
+                if parsed is not None:
+                    first = parsed
+                    break
+            if first:
+                commands.add(first)
+            resolved_cmd = resolve_js_reference(js_path, candidate, var_paths)
+            if resolved_cmd and is_script_file(resolved_cmd):
+                script_refs.add(resolved_cmd)
+
+            if first and (
+                is_python_interpreter_command(first)
+                or JS_INTERPRETER_RE.match(Path(first).name) is not None
+            ):
+                arg_literals = extract_js_array_literals(raw_args, var_paths, var_exprs)
+                for arg in arg_literals:
+                    if arg.startswith("-"):
+                        continue
+                    resolved_arg = resolve_js_reference(js_path, arg, var_paths)
+                    if resolved_arg and is_script_file(resolved_arg):
+                        script_refs.add(resolved_arg)
+                    break
+
+    commands.difference_update(script_refs)
+    return sorted(commands), sorted(script_refs), None
+
+
+def collect_script_command_dependencies(
+    script_path: str, visited: Optional[Set[str]] = None
+) -> Tuple[List[str], List[str], Optional[str]]:
+    if visited is None:
+        visited = set()
+
+    resolved_script = str(Path(script_path).resolve())
+    if resolved_script in visited:
+        return [], [], None
+    visited.add(resolved_script)
+
+    commands: Set[str] = set()
+    scanned_scripts: List[str] = [resolved_script]
+    nested_refs: List[str] = []
+
+    if not is_probably_text_file(resolved_script):
+        shebang = shebang_command_name(resolved_script)
+        if shebang:
+            commands.add(Path(shebang).name)
+        return sorted(commands), scanned_scripts, None
+
+    if is_python_script(resolved_script):
+        py_commands, err = parse_python_command_dependencies(resolved_script)
+        if err:
+            shebang = shebang_command_name(resolved_script)
+            if shebang:
+                commands.add(Path(shebang).name)
+            return sorted(commands), scanned_scripts, None
+        commands.update(py_commands)
+    elif is_javascript_script(resolved_script):
+        js_commands, js_refs, err = parse_javascript_command_dependencies(resolved_script)
+        if err:
+            shebang = shebang_command_name(resolved_script)
+            if shebang:
+                commands.add(Path(shebang).name)
+            return sorted(commands), scanned_scripts, None
+        commands.update(js_commands)
+        nested_refs.extend(js_refs)
+    else:
+        sh_commands, err = parse_shell_command_dependencies(resolved_script)
+        if err:
+            shebang = shebang_command_name(resolved_script)
+            if shebang:
+                commands.add(Path(shebang).name)
+            return sorted(commands), scanned_scripts, None
+        sh_refs, ref_err = parse_shell_script_references(resolved_script)
+        if ref_err:
+            return sorted(commands), scanned_scripts, None
+        commands.update(sh_commands)
+        nested_refs.extend(sh_refs)
+
+    for ref in nested_refs:
+        child_commands, child_scanned, child_err = collect_script_command_dependencies(ref, visited)
+        if child_err:
+            return [], scanned_scripts + child_scanned, child_err
+        commands.update(child_commands)
+        scanned_scripts.extend(child_scanned)
+
+    return sorted(commands), scanned_scripts, None
+
+
+def parse_shell_python_sources(script_path: str) -> Tuple[List[Tuple[str, str]], Optional[str], Optional[str]]:
+    try:
+        source = Path(script_path).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [], f"failed to read script: {exc}", None
+
+    sources: List[Tuple[str, str]] = []
+    seen_labels: Set[str] = set()
+    variable_commands: Dict[str, str] = {}
+    first_interpreter: Optional[str] = None
+    lines = source.splitlines()
+    heredoc_pattern = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+    index = 0
+    while index < len(lines):
+        raw_line = lines[index]
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            index += 1
+            continue
+
+        assign_match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.+)$", stripped)
+        if assign_match:
+            var_name = assign_match.group(1)
+            var_value = assign_match.group(2)
+            
+            parsed_command = extract_shell_assignment_command(script_path, var_value)
+            if parsed_command:
+                variable_commands[var_name] = parsed_command
+
+        match = heredoc_pattern.search(raw_line)
+        command_part = raw_line.split("<<", 1)[0] if match else raw_line
+        tokens = shell_split(command_part)
+        command_info = unwrap_shell_command_tokens(tokens)
+        is_python_cmd = False
+        reads_stdin = False
+
+        if command_info is not None:
+            command, cmd_index = command_info
+            resolved_cmd = resolve_shell_variable_command(
+                script_path, command, variable_commands
+            )
+            actual_cmd = resolved_cmd or command
+            is_python_cmd = is_python_interpreter_command(actual_cmd)
+
+            if is_python_cmd:
+                if first_interpreter is None:
+                    first_interpreter = resolve_shell_reference(script_path, actual_cmd) or actual_cmd
+                    # print(f"  DEBUG parse_shell_python_sources: found python -> {first_interpreter}")
+                arg_index = cmd_index + 1
+                arg_index = cmd_index + 1
+                while arg_index < len(tokens):
+                    token = tokens[arg_index]
+                    if token == "-":
+                        reads_stdin = True
+                        arg_index += 1
+                        continue
+                    if token == "-c":
+                        if arg_index + 1 < len(tokens):
+                            label = f"{Path(script_path).name}:-c@{index + 1}"
+                            if label not in seen_labels:
+                                sources.append((label, tokens[arg_index + 1] + "\n"))
+                                seen_labels.add(label)
+                        break
+                    if token in {"-m"}:
+                        break
+                    if token.startswith("-"):
+                        arg_index += 1
+                        continue
+
+                    resolved = resolve_shell_reference(script_path, token)
+                    if resolved and is_python_script(resolved):
+                        label = resolved
+                        if label not in seen_labels:
+                            try:
+                                code = Path(resolved).read_text(
+                                    encoding="utf-8", errors="replace"
+                                )
+                            except OSError:
+                                code = ""
+                            if code:
+                                sources.append((label, code))
+                                seen_labels.add(label)
+                    break
+
+        if match:
+            if is_python_cmd:
+                reads_stdin = True
+            end_marker = match.group(2)
+            is_indented = "<<-" in raw_line
+            block_start = index + 1
+            index += 1
+            block_lines: List[str] = []
+            while index < len(lines):
+                block_line = lines[index]
+                if block_line.strip() == end_marker:
+                    break
+                if is_indented:
+                    block_lines.append(block_line.lstrip("\t"))
+                else:
+                    block_lines.append(block_line)
+                index += 1
+
+            if is_python_cmd and reads_stdin:
+                label = f"{Path(script_path).name}:heredoc@{block_start + 1}"
+                if label not in seen_labels:
+                    sources.append((label, "\n".join(block_lines) + "\n"))
+                    seen_labels.add(label)
+
+        index += 1
+
+    return sources, None, first_interpreter
+
+
+def resolve_command_by_name(command_name: str) -> Optional[str]:
+    found = shutil.which(command_name)
+    if found:
+        return found
+
+    for directory in SYSTEM_FALLBACK_DIRS:
+        candidate = Path(directory) / command_name
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def resolve_command_dependency(command: str) -> Tuple[str, Optional[str], Optional[str]]:
+    if os.sep in command or (os.altsep is not None and os.altsep in command):
+        path = Path(command)
+        if path.exists() and os.access(path, os.X_OK):
+            return "installed", str(path.resolve()), None
+
+        alternate = resolve_command_by_name(path.name)
+        if alternate:
+            return "expected_missing_present_elsewhere", None, alternate
+        return "missing", None, None
+
+    found = resolve_command_by_name(command)
+    if found:
+        return "installed", found, None
+
+    return "missing", None, None
+
+
+def print_script_command_deps(script_path: str) -> Tuple[int, int]:
+    commands, scanned_scripts, err = collect_script_command_dependencies(script_path)
+    if err:
+        print(f"  {STYLE.red('ERROR')} {err}")
+        return 1, 0
+
+    explicit_paths = {
+        command for command in commands if os.sep in command or (os.altsep and os.altsep in command)
+    }
+    explicit_basenames = {Path(command).name for command in explicit_paths}
+    filtered_commands = [
+        command
+        for command in commands
+        if not (
+            (os.sep not in command and (os.altsep is None or os.altsep not in command))
+            and command in explicit_basenames
+        )
+    ]
+
+    if not filtered_commands:
+        return 0, 0
+
+    print(STYLE.bold(f"System dependencies for {script_path}"))
+    print("  INFO target is a script; checking external command dependencies.")
+    if len(scanned_scripts) > 1:
+        preview = ", ".join(Path(item).name for item in scanned_scripts[:4])
+        if len(scanned_scripts) > 4:
+            preview += f", ... (+{len(scanned_scripts) - 4} more)"
+        print(f"  INFO scanned nested scripts: {preview}")
+
+    missing = 0
+    for command in filtered_commands:
+        status, path, alternate = resolve_command_dependency(command)
+        if status == "installed":
+            print(f"  {STYLE.green('INSTALLED')} {command} -> {path}")
+        elif status == "expected_missing_present_elsewhere":
+            missing += 1
+            print(
+                f"  {STYLE.red('MISSING')}   {command} "
+                f"(expected path missing; found elsewhere at {alternate})"
+            )
+        else:
+            missing += 1
+            print(f"  {STYLE.red('MISSING')}   {command}")
+    return missing, len(filtered_commands)
+
+
+def parse_ldd(output: str) -> List[Tuple[str, Optional[str], bool]]:
+    entries: List[Tuple[str, Optional[str], bool]] = []
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if "=>" in line:
+            name, rest = line.split("=>", 1)
+            dep_name = name.strip()
+            dep_target = rest.strip()
+            if dep_target.startswith("not found"):
+                entries.append((dep_name, None, False))
+            else:
+                dep_path = dep_target.split(" ", 1)[0]
+                entries.append((dep_name, dep_path, True))
+            continue
+
+        token = line.split(" ", 1)[0]
+        if token.startswith("/"):
+            entries.append((Path(token).name, token, True))
+        else:
+            # e.g. linux-vdso.so.1 (virtual mapping)
+            entries.append((token, "[virtual]", True))
+    return entries
+
+
+def print_system_deps(binary_path: str) -> Tuple[int, int]:
+    if has_shebang(binary_path):
+        return print_script_command_deps(binary_path)
+
+    rc, stdout, stderr = run_command(["ldd", binary_path])
+
+    if rc != 0:
+        stderr_text = stderr.strip()
+        if "not a dynamic executable" in stderr_text:
+            interpreter = resolve_shebang_interpreter(binary_path)
+            if interpreter is None:
+                return 0, 0
+            
+            print(STYLE.bold(f"System dependencies for {binary_path}"))
+            print(
+                f"  INFO target is a script; checking interpreter shared libs -> {interpreter}"
+            )
+            rc, stdout, stderr = run_command(["ldd", interpreter])
+            if rc != 0:
+                print(f"  {STYLE.red('ERROR')} failed to run ldd on interpreter")
+                if stderr.strip():
+                    print(f"    {stderr.strip()}")
+                return 1, 0
+        else:
+            print(STYLE.bold(f"System dependencies for {binary_path}"))
+            print(f"  {STYLE.red('ERROR')} failed to run ldd")
+            if stderr_text:
+                print(f"    {stderr_text}")
+            return 1, 0
+    else:
+        # We don't print the header yet, wait to see if there are entries
+        pass
+
+    entries = parse_ldd(stdout)
+    if not entries:
+        return 0, 0
+
+    print(STYLE.bold(f"System dependencies for {binary_path}"))
+    missing = 0
+    for name, dep_path, installed in entries:
+        if installed:
+            print(f"  {STYLE.green('INSTALLED')} {name} -> {dep_path}")
+        else:
+            missing += 1
+            print(f"  {STYLE.red('MISSING')}   {name}")
+
+    return missing, len(entries)
+
+
+def parse_requirement_name(requirement_line: str) -> Optional[str]:
+    line = requirement_line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if any(
+        line.startswith(prefix)
+        for prefix in ("INFO:", "WARNING:", "ERROR:", "Traceback", "ModuleNotFoundError:")
+    ):
+        return None
+
+    if " @ " in line:
+        base = line.split(" @ ", 1)[0].strip()
+    else:
+        split = re.split(r"[<>=!~; ]", line, maxsplit=1)
+        base = split[0].strip() if split else ""
+
+    if "[" in base:
+        base = base.split("[", 1)[0]
+
+    if re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", base):
+        return base
+    return None
+
+
+def identify_python_optional_imports_from_source(source: str) -> Set[str]:
+    try:
+        tree = ast.parse(source)
+    except Exception:
+        return set()
+
+    optional_pkgs = set()
+
+    class OptionalImportVisitor(ast.NodeVisitor):
+        def __init__(self):
+            self.in_try = False
+
+        def visit_Try(self, node):
+            old_in_try = self.in_try
+            self.in_try = True
+            
+            # Visit everything in the try-except-else-finally structure 
+            # while in_try is True.
+            for item in node.body:
+                self.visit(item)
+            for h in node.handlers:
+                self.visit(h)
+            for item in node.orelse:
+                self.visit(item)
+            for item in node.finalbody:
+                self.visit(item)
+                
+            self.in_try = old_in_try
+
+        def visit_Import(self, node):
+            if self.in_try:
+                for alias in node.names:
+                    pkg = alias.name.split(".")[0]
+                    optional_pkgs.add(canonicalize(pkg))
+
+        def visit_ImportFrom(self, node):
+            if self.in_try and node.module:
+                pkg = node.module.split(".")[0]
+                optional_pkgs.add(canonicalize(pkg))
+
+    visitor = OptionalImportVisitor()
+    visitor.visit(tree)
+    return optional_pkgs
+
+
+def get_pipreqs_requirements(project_dir: str) -> Tuple[Optional[List[str]], Set[str], Optional[str]]:
+    target = Path(project_dir)
+    if target.is_file():
+        files = [target]
+        target = target.parent
+    else:
+        files = list(target.rglob("*.py"))
+    
+    project_root = str(target)
+
+    optional_names = set()
+    for f in files:
+        # Ignore .venv/venv
+        if ".venv" in f.parts or "venv" in f.parts:
+            continue
+        try:
+            content = f.read_text(encoding="utf-8", errors="replace")
+            optional_names.update(identify_python_optional_imports_from_source(content))
+        except Exception:
+            pass
+
+    pipreqs_path = shutil.which("pipreqs")
+
+    if pipreqs_path:
+        cmd = [pipreqs_path, "--print", "--ignore", ".venv,venv", project_root]
+    else:
+        cmd = [
+            sys.executable,
+            "-m",
+            "pipreqs",
+            "--print",
+            "--ignore",
+            ".venv,venv",
+            project_root,
+        ]
+
+    rc, stdout, stderr = run_command(cmd)
+    if rc != 0:
+        combined = "\n".join(part for part in (stdout.strip(), stderr.strip()) if part)
+        err = combined or "pipreqs is not available. Install with: pip install pipreqs"
+        return None, set(), err
+
+    requirements: List[str] = []
+    for line in stdout.splitlines():
+        req_name = parse_requirement_name(line)
+        if req_name:
+            requirements.append(line.strip())
+
+    return requirements, optional_names, None
+
+
+def get_pipreqs_requirements_for_python_source(source: str) -> Tuple[Optional[List[str]], Set[str], Optional[str]]:
+    with tempfile.TemporaryDirectory(prefix="deps_py_") as temp_dir:
+        temp_path = Path(temp_dir) / "snippet.py"
+        temp_path.write_text(source, encoding="utf-8")
+        return get_pipreqs_requirements(temp_dir)
+
+
+def collect_script_python_requirements(
+    script_path: str,
+) -> Tuple[Optional[List[str]], Set[str], List[str], Optional[str], Optional[str]]:
+    sources, err, interpreter = parse_shell_python_sources(script_path)
+    if err:
+        return None, set(), [], err, interpreter
+    if not sources:
+        return [], set(), [], None, interpreter
+
+    by_name: Dict[str, str] = {}
+    optional_packages: Set[str] = set()
+    scanned_labels: List[str] = []
+    for label, source in sources:
+        scanned_labels.append(label)
+        requirements, opt_names, req_err = get_pipreqs_requirements_for_python_source(source)
+        if req_err:
+            return None, optional_packages, scanned_labels, f"{label}: {req_err}", interpreter
+        if requirements is None:
+            continue
+
+        optional_packages.update(opt_names)
+        for req_line in requirements:
+            req_name = parse_requirement_name(req_line)
+            if req_name is None:
+                continue
+            key = canonicalize(req_name)
+            if key not in by_name:
+                by_name[key] = req_line
+
+    return list(by_name.values()), optional_packages, scanned_labels, None, interpreter
+
+
+def installed_distributions(interpreter_path: Optional[str] = None) -> Dict[str, metadata.Distribution]:
+    search_path = []
+    if interpreter_path:
+        # Resolve to absolute path if possible
+        full_path = shutil.which(interpreter_path) or interpreter_path
+        if os.path.exists(full_path):
+            # Get the sys.path of the target interpreter
+            rc, stdout, stderr = run_command([full_path, "-c", "import sys; print('\\n'.join(sys.path))"])
+            if rc == 0:
+                search_path = [p for p in stdout.splitlines() if p.strip()]
+
+    # Always include sys.path as a fallback
+    effective_path = search_path + [p for p in sys.path if p not in search_path]
+
+    dist_map: Dict[str, metadata.Distribution] = {}
+    for dist in metadata.distributions(path=effective_path):
+        name = dist.metadata.get("Name")
+        if not name:
+            continue
+        
+        key = canonicalize(name)
+        # Precedence: the first distribution found for a name wins
+        if key in dist_map:
+            continue
+            
+        dist_map[key] = dist
+
+        # Also map top-level modules to this distribution.
+        # This handles cases like argon2-cffi being imported as 'argon2'.
+        try:
+            top_level = dist.read_text("top_level.txt")
+            if top_level:
+                for line in top_level.splitlines():
+                    module_name = line.strip()
+                    if module_name:
+                        dist_map[canonicalize(module_name)] = dist
+            else:
+                # Fallback: some packages don't have top_level.txt
+                # Try to infer from files (e.g., argon2/*.py -> argon2)
+                if dist.files:
+                    roots = set()
+                    for f in dist.files:
+                        parts = f.parts
+                        if len(parts) > 1 and parts[0].endswith(".dist-info"):
+                            continue
+                        if len(parts) > 1:
+                            roots.add(parts[0])
+                        elif parts[0].endswith(".py"):
+                            roots.add(parts[0][:-3])
+                    for root in roots:
+                        dist_map[canonicalize(root)] = dist
+        except Exception:
+            pass
+
+    return dist_map
+
+
+def find_venv_interpreter(project_dir: Path) -> Optional[str]:
+    # Check for .venv or venv in the project directory
+    for venv_name in (".venv", "venv"):
+        venv_path = project_dir / venv_name
+        if venv_path.exists() and venv_path.is_dir():
+            # Check common locations for the python binary
+            for bin_dir in ("bin", "Scripts"):
+                # Check for python, python3, python3.x
+                python_bin = venv_path / bin_dir / "python"
+                if python_bin.exists():
+                    return str(python_bin.absolute())
+                python3_bin = venv_path / bin_dir / "python3"
+                if python3_bin.exists():
+                    return str(python3_bin.absolute())
+    return None
+
+
+def print_python_deps(project_dir: str, binary_path: Optional[str] = None) -> Tuple[int, int]:
+    scan_target = Path(project_dir)
+    if scan_target.is_file():
+        scan_target = scan_target.parent
+
+    requirements, optional_names, err = get_pipreqs_requirements(str(scan_target))
+    if err:
+        print(STYLE.bold(f"\nPython dependencies (pipreqs) for {scan_target.resolve()}"))
+        print(f"  {STYLE.red('ERROR')} {err}")
+        return 1, 0
+
+    if requirements is None:
+        print(STYLE.bold(f"\nPython dependencies (pipreqs) for {scan_target.resolve()}"))
+        print(f"  {STYLE.red('ERROR')} unable to resolve requirements")
+        return 1, 0
+
+    deduped: Dict[str, str] = {}
+    for req_line in requirements:
+        req_name = parse_requirement_name(req_line)
+        if req_name is None:
+            continue
+        deduped.setdefault(canonicalize(req_name), req_line)
+
+    interpreter = None
+    scanned_labels = []
+    if binary_path and has_shebang(binary_path) and not is_python_script(binary_path):
+        extra_requirements, extra_opt, scanned_labels, extra_err, interpreter = collect_script_python_requirements(binary_path)
+        if extra_err:
+            print(STYLE.bold(f"\nPython dependencies (pipreqs) for {scan_target.resolve()}"))
+            print(f"  {STYLE.red('ERROR')} {extra_err}")
+            return 1, 0
+        
+        optional_names.update(extra_opt)
+        if extra_requirements:
+            for req_line in extra_requirements:
+                req_name = parse_requirement_name(req_line)
+                if req_name is None:
+                    continue
+                deduped.setdefault(canonicalize(req_name), req_line)
+
+    # If still no interpreter found, look for a local .venv
+    if interpreter is None:
+        interpreter = find_venv_interpreter(scan_target)
+
+    requirement_lines = list(deduped.values())
+    if not requirement_lines:
+        return 0, 0
+
+    print(STYLE.bold(f"\nPython dependencies (pipreqs) for {scan_target.resolve()}"))
+    if scanned_labels:
+        preview = ", ".join(Path(item).name for item in scanned_labels[:3])
+        if len(scanned_labels) > 3:
+            preview += f", ... (+{len(scanned_labels) - 3} more)"
+        print(f"  INFO scanned Python sources from script: {preview}")
+    
+    if interpreter:
+        print(f"  INFO using environment from: {interpreter}")
+
+    dist_map = installed_distributions(interpreter)
+    missing = 0
+    optional_missing = 0
+    for req_line in requirement_lines:
+        name = parse_requirement_name(req_line)
+        if not name:
+            continue
+        
+        canon_name = canonicalize(name)
+        is_optional = canon_name in optional_names
+        opt_tag = f" {STYLE.bold('(OPTIONAL)')}" if is_optional else ""
+        
+        dist = dist_map.get(canon_name)
+        if dist is None:
+            if is_optional:
+                optional_missing += 1
+                print(f"  {STYLE.bold('MISSING')}   {req_line}{opt_tag}")
+            else:
+                missing += 1
+                print(f"  {STYLE.red('MISSING')}   {req_line}{opt_tag}")
+            continue
+
+        location = str(dist.locate_file(""))
+        version = dist.version
+        print(f"  {STYLE.green('INSTALLED')} {req_line}{opt_tag} -> {location} (installed: {version})")
+
+    return missing, len(requirement_lines)
+
+
+def print_python_deps_only_from_binary(binary_path: str) -> Tuple[int, int]:
+    extra_requirements, optional_names, scanned_labels, extra_err, interpreter = collect_script_python_requirements(binary_path)
+    if extra_err:
+        print(STYLE.bold(f"\nPython dependencies for {binary_path}"))
+        print(f"  {STYLE.red('ERROR')} {extra_err}")
+        return 1, 0
+
+    if not extra_requirements:
+        return 0, 0
+
+    print(STYLE.bold(f"\nPython dependencies for {binary_path}"))
+    if scanned_labels:
+        preview = ", ".join(Path(item).name for item in scanned_labels[:3])
+        if len(scanned_labels) > 3:
+            preview += f", ... (+{len(scanned_labels) - 3} more)"
+        print(f"  INFO scanned Python sources from script: {preview}")
+    
+    if interpreter:
+        print(f"  INFO using environment from: {interpreter}")
+    else:
+        # Check for .venv in binary's directory
+        interpreter = find_venv_interpreter(Path(binary_path).resolve().parent)
+        if interpreter:
+            print(f"  INFO using environment from: {interpreter}")
+
+    dist_map = installed_distributions(interpreter)
+    missing = 0
+    optional_missing = 0
+    for req_line in extra_requirements:
+        name = parse_requirement_name(req_line)
+        if not name:
+            continue
+        
+        canon_name = canonicalize(name)
+        is_optional = canon_name in optional_names
+        opt_tag = f" {STYLE.bold('(OPTIONAL)')}" if is_optional else ""
+
+        dist = dist_map.get(canon_name)
+        if dist is None:
+            if is_optional:
+                optional_missing += 1
+                print(f"  {STYLE.bold('MISSING')}   {req_line}{opt_tag}")
+            else:
+                missing += 1
+                print(f"  {STYLE.red('MISSING')}   {req_line}{opt_tag}")
+            continue
+
+        location = str(dist.locate_file(""))
+        version = dist.version
+        print(f"  {STYLE.green('INSTALLED')} {req_line}{opt_tag} -> {location} (installed: {version})")
+
+    return missing, len(extra_requirements)
+
+
+def parse_javascript_package_dependencies(js_path: str) -> Tuple[List[str], Optional[str]]:
+    try:
+        source = Path(js_path).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [], f"failed to read script: {exc}"
+
+    packages: Set[str] = set()
+    
+    # regex for require('pkg'), import ... from 'pkg', and import('pkg')
+    # capturing the package name
+    require_pattern = re.compile(r"\brequire\s*\(\s*['\"]([^'.][^'\"]*)['\"]\s*\)")
+    import_from_pattern = re.compile(r"\bfrom\s*['\"]([^'.][^'\"]*)['\"]")
+    dynamic_import_pattern = re.compile(r"\bimport\s*\(\s*['\"]([^'.][^'\"]*)['\"]\s*\)")
+    
+    # Standard Node built-ins to ignore
+    node_builtins = {
+        "fs", "path", "child_process", "crypto", "os", "sys", "util", "events", 
+        "http", "https", "net", "dns", "url", "querystring", "readline", 
+        "stream", "buffer", "zlib", "vm", "tls", "assert", "constants", "punycode"
+    }
+
+    for match in require_pattern.finditer(source):
+        pkg = match.group(1).split("/")[0]
+        if pkg not in node_builtins:
+            packages.add(pkg)
+            
+    for match in import_from_pattern.finditer(source):
+        pkg = match.group(1).split("/")[0]
+        if pkg not in node_builtins:
+            packages.add(pkg)
+            
+    for match in dynamic_import_pattern.finditer(source):
+        pkg = match.group(1).split("/")[0]
+        if pkg not in node_builtins:
+            packages.add(pkg)
+
+    return sorted(packages), None
+
+
+def collect_script_javascript_requirements(
+    script_path: str, visited: Optional[Set[str]] = None
+) -> Tuple[List[str], List[str], Optional[str]]:
+    if visited is None:
+        visited = set()
+
+    resolved_script = str(Path(script_path).resolve())
+    if resolved_script in visited:
+        return [], [], None
+    visited.add(resolved_script)
+
+    packages: Set[str] = set()
+    scanned_scripts: List[str] = [resolved_script]
+    
+    if not is_probably_text_file(resolved_script):
+        return [], scanned_scripts, None
+
+    if is_javascript_script(resolved_script):
+        js_pkgs, err = parse_javascript_package_dependencies(resolved_script)
+        if not err:
+            packages.update(js_pkgs)
+        
+        # Also follow internal references to other JS files
+        _, js_refs, _ = parse_javascript_command_dependencies(resolved_script)
+        for ref in js_refs:
+            child_pkgs, child_scanned, child_err = collect_script_javascript_requirements(ref, visited)
+            if not child_err:
+                packages.update(child_pkgs)
+                scanned_scripts.extend(child_scanned)
+    elif not is_python_script(resolved_script):
+        # Could be a shell script wrapper
+        sh_refs, ref_err = parse_shell_script_references(resolved_script)
+        if not ref_err:
+            for ref in sh_refs:
+                child_pkgs, child_scanned, child_err = collect_script_javascript_requirements(ref, visited)
+                if not child_err:
+                    packages.update(child_pkgs)
+                    scanned_scripts.extend(child_scanned)
+
+    return sorted(packages), scanned_scripts, None
+
+
+def find_package_json(start_path: Path) -> Optional[Path]:
+    curr = start_path.resolve()
+    if curr.is_file():
+        curr = curr.parent
+    
+    while True:
+        pkg_json = curr / "package.json"
+        if pkg_json.exists():
+            return pkg_json
+        if curr.parent == curr:
+            break
+        curr = curr.parent
+    return None
+
+
+def print_javascript_deps(project_dir: str, binary_path: Optional[str] = None) -> Tuple[int, int]:
+    scan_target = Path(project_dir).resolve()
+    if scan_target.is_file():
+        scan_target = scan_target.parent
+    
+    # Identify packages needed by the binary (and its nested refs)
+    required_packages = set()
+    scanned_labels = []
+    if binary_path:
+        pkgs, scanned, err = collect_script_javascript_requirements(binary_path)
+        if err:
+            print(STYLE.bold(f"\nJavaScript dependencies for {scan_target}"))
+            print(f"  {STYLE.red('ERROR')} {err}")
+            return 1, 0
+        required_packages.update(pkgs)
+        scanned_labels.extend(scanned)
+
+    if not required_packages:
+        return 0, 0
+
+    print(STYLE.bold(f"\nJavaScript dependencies for {scan_target}"))
+    if scanned_labels:
+        preview = ", ".join(Path(item).name for item in scanned_labels[:3])
+        if len(scanned_labels) > 3:
+            preview += f", ... (+{len(scanned_labels) - 3} more)"
+        print(f"  INFO scanned JavaScript sources: {preview}")
+
+    # Check for package.json to verify installation and versions
+    pkg_json_path = find_package_json(scan_target)
+    project_pkgs = {}
+    if pkg_json_path:
+        try:
+            with open(pkg_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                deps = data.get("dependencies", {})
+                dev_deps = data.get("devDependencies", {})
+                project_pkgs.update(deps)
+                project_pkgs.update(dev_deps)
+        except Exception:
+            pass
+
+    # Check node_modules for physical existence
+    node_modules_dir = (pkg_json_path.parent / "node_modules") if pkg_json_path else (scan_target / "node_modules")
+    
+    missing = 0
+    for pkg in sorted(required_packages):
+        spec = project_pkgs.get(pkg, "*")
+        pkg_dir = node_modules_dir / pkg
+        if pkg_dir.exists() and pkg_dir.is_dir():
+            # Try to get version from its own package.json
+            version = "unknown"
+            try:
+                with open(pkg_dir / "package.json", "r") as f:
+                    vdata = json.load(f)
+                    version = vdata.get("version", "unknown")
+            except Exception:
+                pass
+            print(f"  {STYLE.green('INSTALLED')} {pkg} ({spec}) -> {pkg_dir} (installed: {version})")
+        else:
+            missing += 1
+            print(f"  {STYLE.red('MISSING')}   {pkg} ({spec})")
+
+    return missing, len(required_packages)
+
+
+def infer_project_target(binary_path: str) -> str:
+    if is_script_file(binary_path):
+        return binary_path
+    return "."
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Report shared-library dependencies for a binary and Python package dependencies "
+            "for a project (via pipreqs), highlighting installed/missing entries."
+        )
+    )
+    parser.add_argument(
+        "binary",
+        help="Binary path or executable name to inspect with ldd",
+    )
+    parser.add_argument(
+        "project",
+        nargs="?",
+        default=None,
+        help=(
+            "Python project directory to inspect with pipreqs "
+            "(default: infer from binary; otherwise current directory)"
+        ),
+    )
+    return parser.parse_args()
+
+
+def run_consistency_check(project_dir: str) -> None:
+    print(STYLE.bold("\nEnvironment Consistency Check"))
+    
+    uv_path = shutil.which("uv")
+    if uv_path:
+        # Check if it's a uv project or just use uv pip check
+        rc, stdout, stderr = run_command([uv_path, "pip", "check"])
+        if rc == 0:
+            print(f"  {STYLE.green('OK')} uv pip check: No broken requirements found.")
+        else:
+            print(f"  {STYLE.red('WARNING')} uv pip check found issues:")
+            for line in stdout.splitlines():
+                if line.strip():
+                    print(f"    {line.strip()}")
+    else:
+        pip_path = shutil.which("pip") or shutil.which("pip3")
+        if pip_path:
+            rc, stdout, stderr = run_command([pip_path, "check"])
+            if rc == 0:
+                print(f"  {STYLE.green('OK')} pip check: No broken requirements found.")
+            else:
+                print(f"  {STYLE.red('WARNING')} pip check found issues:")
+                for line in stdout.splitlines():
+                    if line.strip():
+                        print(f"    {line.strip()}")
+        else:
+            print("  INFO No pip/uv found for consistency check.")
+
+def main() -> int:
+    args = parse_args()
+    binary_path = resolve_binary(args.binary)
+
+    if binary_path is None:
+        print(f"{STYLE.red('ERROR')} binary not found: {args.binary}")
+        return 1
+
+    project_target = args.project if args.project is not None else infer_project_target(binary_path)
+    system_missing, system_total = print_system_deps(binary_path)
+
+    # Only perform a general Python project scan if:
+    # 1. The project was explicitly specified
+    # 2. OR the binary is a Python script (and we infer '.' or its location)
+    # If the binary is a shell script, we ONLY want to scan its internal requirements.
+    if args.project is not None or is_python_script(binary_path):
+        py_missing, py_total = print_python_deps(project_target, binary_path)
+    else:
+        # Scan only the binary itself for embedded Python
+        py_missing, py_total = print_python_deps_only_from_binary(binary_path)
+
+    js_missing, js_total = print_javascript_deps(project_target, binary_path)
+
+    run_consistency_check(str(Path(project_target).resolve()))
+
+    total_missing = system_missing + py_missing + js_missing
+    print(STYLE.bold("\nSummary"))
+    print(f"  System deps checked: {system_total}, missing: {system_missing}")
+    print(f"  Python deps checked: {py_total}, missing: {py_missing}")
+    print(f"  JavaScript deps checked: {js_total}, missing: {js_missing}")
+
+    return 1 if total_missing else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
