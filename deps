@@ -1446,24 +1446,26 @@ class DepEntry:
     extra_info: Optional[str] = None
 
 
-def get_script_command_dep_entries(
-    script_path: str,
+def resolve_and_map_commands(
+    commands: Set[str], script_refs: Set[str], base_path: str
 ) -> Tuple[List[DepEntry], List[str], Optional[str]]:
-    commands, script_refs, err = collect_script_command_dependencies(script_path)
-    if err:
-        return [], [], err
-
-    project_dir = str(Path(script_path).resolve().parent)
+    project_dir = str(
+        Path(base_path).resolve()
+        if Path(base_path).is_dir()
+        else Path(base_path).resolve().parent
+    )
     entries: List[DepEntry] = []
 
     # Process all found commands and script references
     all_potential_cmds = set(commands) | set(script_refs)
-    
+
     explicit_paths = {
-        cmd for cmd in all_potential_cmds if os.sep in cmd or (os.altsep and os.altsep in cmd)
+        cmd
+        for cmd in all_potential_cmds
+        if os.sep in cmd or (os.altsep and os.altsep in cmd)
     }
     explicit_basenames = {Path(cmd).name for cmd in explicit_paths}
-    
+
     filtered_cmds = [
         cmd
         for cmd in all_potential_cmds
@@ -1484,7 +1486,7 @@ def get_script_command_dep_entries(
 
         status = "INSTALLED" if status_key == "installed" else "MISSING"
         final_path = path or alternate
-        
+
         info = None
         if status_key == "expected_missing_present_elsewhere":
             info = f"expected path missing; found elsewhere at {alternate}"
@@ -1500,7 +1502,16 @@ def get_script_command_dep_entries(
             )
         )
 
-    return entries, script_refs, None
+    return entries, sorted(script_refs), None
+
+
+def get_script_command_dep_entries(
+    script_path: str,
+) -> Tuple[List[DepEntry], List[str], Optional[str]]:
+    commands, script_refs, err = collect_script_command_dependencies(script_path)
+    if err:
+        return [], [], err
+    return resolve_and_map_commands(set(commands), set(script_refs), script_path)
 
 
 def parse_ldd(output: str) -> List[Tuple[str, Optional[str], bool]]:
@@ -2126,7 +2137,28 @@ def print_javascript_deps(project_dir: str, binary_path: Optional[str] = None) -
     return missing, len(required_packages)
 
 
-def get_system_dep_entries(binary_path: str) -> Tuple[List[DepEntry], List[str], Optional[str]]:
+def get_system_dep_entries(
+    binary_path: str,
+) -> Tuple[List[DepEntry], List[str], Optional[str]]:
+    p = Path(binary_path)
+    if p.is_dir():
+        all_cmds: Set[str] = set()
+        all_refs: Set[str] = set()
+        for f in p.rglob("*"):
+            # Skip hidden dirs, node_modules, venvs
+            if (
+                any(part.startswith(".") for part in f.parts)
+                or "node_modules" in f.parts
+                or "venv" in f.parts
+            ):
+                continue
+            if f.is_file() and has_shebang(str(f)):
+                cmds, refs, err = collect_script_command_dependencies(str(f))
+                if not err:
+                    all_cmds.update(cmds)
+                    all_refs.update(refs)
+        return resolve_and_map_commands(all_cmds, all_refs, binary_path)
+
     if has_shebang(binary_path):
         return get_script_command_dep_entries(binary_path)
 
@@ -2309,6 +2341,9 @@ def get_javascript_dep_entries(
 
 
 def infer_project_target(binary_path: str) -> str:
+    p = Path(binary_path)
+    if p.is_dir():
+        return binary_path
     if is_script_file(binary_path):
         return binary_path
     return "."
@@ -2341,15 +2376,19 @@ def print_master_list(
     binary_path: str, project_target: str, is_nested: bool = False
 ) -> Tuple[int, List[DepEntry], List[str]]:
     # 1. Detect Script Type for Header
-    script_type = "binary"
-    if is_python_script(binary_path):
+    p = Path(binary_path)
+    if p.is_dir():
+        script_type = "Directory"
+    elif is_python_script(binary_path):
         script_type = "Python script"
     elif is_javascript_script(binary_path):
         script_type = "JavaScript script"
     elif has_shebang(binary_path):
         script_type = "Bash script"
+    else:
+        script_type = "binary"
 
-    header = f"{Path(binary_path).name} ({script_type})"
+    header = f"{p.name} ({script_type})"
     if is_nested:
         print(f"\n{STYLE.bold(header)}  {binary_path}")
     else:
@@ -2391,11 +2430,11 @@ def print_master_list(
     missing_count = 0
     
     # Check if we should print the 'standard library' message
-    has_py_deps = any(e.category in ("py", "py-emb", "python module", "embedded python") for e in all_entries)
+    has_py_deps = any(e.category in ("py", "py-emb") for e in all_entries)
     if not has_py_deps and script_type == "Python script":
         print("  INFO all imported modules are part of the standard library.")
     
-    has_js_deps = any(e.category in ("js", "js package") for e in all_entries)
+    has_js_deps = any(e.category == "js" for e in all_entries)
     if not has_js_deps and script_type == "JavaScript script":
         print("  INFO only built-in Node.js modules used.")
 
@@ -2494,14 +2533,25 @@ def main() -> int:
 
     run_consistency_check(project_target)
 
+    # Summary
     print(STYLE.bold("\nSummary"))
-    sys_total = len([e for e in all_collected_entries if e.category in ("bin", "lib")])
-    py_total = len([e for e in all_collected_entries if e.category in ("py", "py-emb")])
-    js_total = len([e for e in all_collected_entries if e.category == "js"])
     
-    print(f"  System deps checked: {sys_total}, missing: {len([e for e in all_collected_entries if e.category in ('bin', 'lib') and e.status == 'MISSING'])}")
-    print(f"  Python deps checked: {py_total}, missing: {len([e for e in all_collected_entries if e.category in ('py', 'py-emb') and e.status == 'MISSING' and not e.optional])}")
-    print(f"  JavaScript deps checked: {js_total}, missing: {len([e for e in all_collected_entries if e.category == 'js' and e.status == 'MISSING'])}")
+    # Deduplicate for summary
+    summary_entries = []
+    seen = set()
+    for e in all_collected_entries:
+        key = (e.category, e.name)
+        if key not in seen:
+            seen.add(key)
+            summary_entries.append(e)
+    
+    sys_total = len([e for e in summary_entries if e.category in ("bin", "lib")])
+    py_total = len([e for e in summary_entries if e.category in ("py", "py-emb")])
+    js_total = len([e for e in summary_entries if e.category == "js"])
+    
+    print(f"  System deps checked: {sys_total}, missing: {len([e for e in summary_entries if e.category in ('bin', 'lib') and e.status == 'MISSING'])}")
+    print(f"  Python deps checked: {py_total}, missing: {len([e for e in summary_entries if e.category in ('py', 'py-emb') and e.status == 'MISSING' and not e.optional])}")
+    print(f"  JavaScript deps checked: {js_total}, missing: {len([e for e in summary_entries if e.category == 'js' and e.status == 'MISSING'])}")
 
     return 1 if total_missing > 0 else 0
 
