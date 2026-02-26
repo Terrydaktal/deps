@@ -4,14 +4,20 @@
 
 ## Features
 
+### 🌍 Universe Discovery
+- **Recursive Script Following:** Automatically follows references from one script to another (e.g., a Bash script calling a JS file).
+- **Per-File Reporting:** Generates a distinct dependency list for every unique file discovered in the project "universe."
+- **Multi-Language Support:** Seamlessly transitions between Bash, Python, and JavaScript while following dependencies.
+
 ### 🌍 Environment Awareness
 - **Virtual Environment Detection:** Automatically identifies and uses local `.venv` or `venv` directories.
 - **Wrapper Support:** Resolves `VENV_PY` style variables in shell wrappers to check dependencies against the *correct* Python environment.
 - **System Fallback:** If a dependency isn't in your virtual environment, it automatically checks user-local and system-wide site-packages.
 
 ### 🐍 Python Deep Inspection
-- **Source Analysis:** Uses AST (Abstract Syntax Tree) to find imports.
+- **Source Analysis:** Uses AST (Abstract Syntax Tree) to find imports and system calls.
 - **Optional Dependency Detection:** Identifies imports wrapped in `try...except` blocks and marks them as `(OPTIONAL)`, excluding them from fatal error counts.
+- **Argparse & Pathlib Support:** Scans `argparse` defaults and understands `pathlib.Path` joins to find external tool requirements.
 - **Embedded Code:** Extracts and scans Python source code from Bash heredocs and `python -c` strings.
 - **Transitive Filtering:** Ignores internal library noise by excluding virtual environment folders from the scan.
 
@@ -39,22 +45,26 @@
 ./deps --project ~/Dev/my_project crawler.py
 ```
 
-## Unified Output Format
+## Unified Master List Format
 
-`deps` provides a consolidated master list per target, categorized by type:
+`deps` provides a consolidated, dynamically aligned report per target:
 
 ```text
-main.py (Python script)
-  [bin]           INSTALLED  hd-bet -> /home/lewis/Dev/mri/.venv/bin/hd-bet [via python package: HD_BET]
-  [bin]           INSTALLED  mri_synthstrip -> /home/lewis/Dev/mri/scripts/mri_synthstrip
-  [py]            INSTALLED  nibabel==5.3.3 -> /home/lewis/Dev/mri/.venv/lib/python3.12/site-packages (installed: 5.3.3)
-  [py]            INSTALLED  numpy==2.4.2 -> /home/lewis/Dev/mri/.venv/lib/python3.12/site-packages (installed: 2.4.2)
-  [py]            INSTALLED  SimpleITK==2.5.3 (OPTIONAL) -> ...
+chatbot (Bash script)
+  [bin] INSTALLED  /bin/chromium -> /bin/chromium
+  [bin] INSTALLED  /home/lewis/Dev/chatbot/chatbot.js -> /home/lewis/Dev/chatbot/chatbot.js
+  [bin] INSTALLED  bash -> /bin/bash
+  ...
+
+chatbot.js (JavaScript script)
+  [bin] INSTALLED  node -> /bin/node
+  [js]  INSTALLED  chalk (^4.1.2) -> .../node_modules/chalk (installed: 4.1.2)
+  [js]  INSTALLED  commander (^14.0.2) -> .../node_modules/commander (installed: 14.0.2)
 ```
 
 ### Category Tags
-- **`[bin]`**: System Commands / Executables
-- **`[lib]`**: Shared Libraries (for compiled binaries)
+- **`[bin]`**: System Commands / Executables (found in scripts)
+- **`[lib]`**: Shared Libraries (found in compiled binaries)
 - **`[py]`**: Python Modules
 - **`[py-emb]`**: Embedded Python code (inside Bash wrappers)
 - **`[js]`**: JavaScript / npm Packages
@@ -63,9 +73,9 @@ main.py (Python script)
 
 `deps` uses a hybrid approach to ensure accuracy:
 1.  **Phase 1: Binary/Shebang Resolution:** Identifies if the target is a binary or a script and resolves its real path.
-2.  **Phase 2: Static Analysis:** Parses the source code (or binary headers) to find external calls and imports.
-3.  **Phase 3: Environment Discovery:** Finds the relevant Python/Node.js environment (venv, node_modules).
-4.  **Phase 4: Truth-Based Verification:** Queries the actual filesystem and package managers to confirm the dependency is `INSTALLED` and functional.
+2.  **Phase 2: Discovery Loop:** Recursively follows every script reference found to build a complete project "universe."
+3.  **Phase 3: Static Analysis:** Parses source code (AST) or binary headers (`ldd`) to find external calls and imports.
+4.  **Phase 4: Truth-Based Verification:** Queries the actual filesystem and package managers to confirm the dependency is `INSTALLED` and functional in the specific detected environment.
 
 ## Installation
 
