@@ -636,15 +636,40 @@ def string_values(expr: ast.AST, assigns: Dict[str, ast.AST], depth: int = 0) ->
         return string_values(expr.body, assigns, depth + 1) | string_values(
             expr.orelse, assigns, depth + 1
         )
-    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
-        left = string_values(expr.left, assigns, depth + 1)
-        right = string_values(expr.right, assigns, depth + 1)
-        out: Set[str] = set()
-        if left and right and len(left) <= 12 and len(right) <= 12:
-            for l_item in left:
-                for r_item in right:
-                    out.add(l_item + r_item)
-        return out
+    if isinstance(expr, ast.Call):
+        name = called_name(expr.func)
+        if name:
+            # Handle Path('...') or project_root()
+            if name == "Path" and expr.args:
+                return string_values(expr.args[0], assigns, depth + 1)
+            if "root" in name.lower() or "dir" in name.lower():
+                return {""}
+            
+            # Handle Path('...').resolve() or similar chain
+            if isinstance(expr.func, ast.Attribute):
+                return string_values(expr.func.value, assigns, depth + 1)
+
+    if isinstance(expr, ast.BinOp):
+        if isinstance(expr.op, ast.Add):
+            left = string_values(expr.left, assigns, depth + 1)
+            right = string_values(expr.right, assigns, depth + 1)
+            out: Set[str] = set()
+            if left and right and len(left) <= 12 and len(right) <= 12:
+                for l_item in left:
+                    for r_item in right:
+                        out.add(l_item + r_item)
+            return out
+        if isinstance(expr.op, ast.Div):
+            # Path joining: base / 'sub' / 'file'
+            left = string_values(expr.left, assigns, depth + 1)
+            right = string_values(expr.right, assigns, depth + 1)
+            out: Set[str] = set()
+            if left and right and len(left) <= 12 and len(right) <= 12:
+                for l_item in left:
+                    for r_item in right:
+                        # Simple join logic for path-like strings
+                        out.add(os.path.join(l_item, r_item))
+            return out
     return set()
 
 
@@ -721,7 +746,13 @@ def parse_python_command_dependencies(script_path: str) -> Tuple[List[str], Opti
         "run_command",
         "os.system",
     }
-    dependency_hint_calls = {"shutil.which", "_find_tool_or_common_paths"}
+    dependency_hint_calls = {
+        "shutil.which",
+        "_find_tool_or_common_paths",
+        "ensure_binary",
+        "resolve_synthstrip_cmd",
+        "detect_hdbet_cli",
+    }
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
@@ -737,6 +768,21 @@ def parse_python_command_dependencies(script_path: str) -> Tuple[List[str], Opti
         fn_name = called_name(node.func)
         if fn_name is None:
             continue
+
+        # Detect argparse defaults: parser.add_argument('--cmd', default='mytool')
+        if fn_name.endswith(".add_argument"):
+            arg_names = [arg.value for arg in node.args if isinstance(arg, ast.Constant)]
+            is_likely_command_arg = any(
+                any(keyword in name.lower() for keyword in ("cmd", "bin", "exe", "path", "executable"))
+                for name in arg_names
+            )
+            if is_likely_command_arg:
+                for kw in node.keywords:
+                    if kw.arg == "default":
+                        for raw in string_values(kw.value, assigns):
+                            cmd = command_from_token(raw)
+                            if cmd is not None:
+                                commands.add(cmd)
 
         if fn_name in dependency_hint_calls:
             if node.args:
@@ -1333,13 +1379,18 @@ def resolve_command_by_name(command_name: str) -> Optional[str]:
     return None
 
 
-def resolve_command_dependency(command: str) -> Tuple[str, Optional[str], Optional[str]]:
+def resolve_command_dependency(
+    command: str, project_dir: Optional[str] = None
+) -> Tuple[str, Optional[str], Optional[str]]:
     if os.sep in command or (os.altsep is not None and os.altsep in command):
         path = Path(command)
+        if not path.is_absolute() and project_dir:
+            path = Path(project_dir) / path
+
         if path.exists() and os.access(path, os.X_OK):
             return "installed", str(path.resolve()), None
 
-        alternate = resolve_command_by_name(path.name)
+        alternate = resolve_command_by_name(Path(command).name)
         if alternate:
             return "expected_missing_present_elsewhere", None, alternate
         return "missing", None, None
@@ -1347,6 +1398,27 @@ def resolve_command_dependency(command: str) -> Tuple[str, Optional[str], Option
     found = resolve_command_by_name(command)
     if found:
         return "installed", found, None
+
+    # Fallback: check project_dir and common subdirectories for the command name
+    if project_dir:
+        # 1. Direct in project root
+        candidate = Path(project_dir) / command
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return "installed", str(candidate.resolve()), None
+        
+        # 2. In common subdirectories
+        for sub in ("scripts", "bin", "tools", "libexec"):
+            candidate = Path(project_dir) / sub / command
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return "installed", str(candidate.resolve()), None
+
+        # 3. In virtual environment bin
+        venv_python = find_venv_interpreter(Path(project_dir))
+        if venv_python:
+            venv_bin = Path(venv_python).parent
+            candidate = venv_bin / command
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return "installed", str(candidate.resolve()), None
 
     return "missing", None, None
 
@@ -1376,8 +1448,9 @@ def print_script_command_deps(script_path: str) -> Tuple[int, int]:
     # Existence-aware filtering and result collection
     results: List[Tuple[str, str, str, str]] = []
     missing = 0
+    project_dir = str(Path(script_path).resolve().parent)
     for command in filtered_commands:
-        status, path, alternate = resolve_command_dependency(command)
+        status, path, alternate = resolve_command_dependency(command, project_dir)
         
         # If it's a weak keyword/false-positive candidate and it's missing, ignore it.
         if status == "missing" and command in POTENTIAL_COMMANDS:
