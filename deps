@@ -1650,13 +1650,22 @@ def identify_python_optional_imports_from_source(source: str) -> Set[str]:
 
 def get_pipreqs_requirements(project_dir: str) -> Tuple[Optional[List[str]], Set[str], Optional[str]]:
     target = Path(project_dir)
-    if target.is_file():
-        files = [target]
-        target = target.parent
-    else:
-        files = list(target.rglob("*.py"))
     
-    project_root = str(target)
+    # If target is a single file, we MUST use a temp dir to avoid scanning
+    # the entire parent directory (which could be /usr/bin).
+    if target.is_file():
+        with tempfile.TemporaryDirectory(prefix="deps_pipreqs_") as temp_dir:
+            temp_path = Path(temp_dir) / target.name
+            try:
+                shutil.copy2(target, temp_path)
+            except OSError as exc:
+                return None, set(), f"failed to copy script for scanning: {exc}"
+            
+            # Recurse with the temp directory
+            return get_pipreqs_requirements(temp_dir)
+
+    files = list(target.rglob("*.py"))
+    project_root = str(target.resolve())
 
     optional_names = set()
     for f in files:
@@ -2148,9 +2157,7 @@ def get_python_dep_entries(
     project_dir: str, binary_path: Optional[str] = None
 ) -> Tuple[List[DepEntry], List[str], Optional[str], Optional[str]]:
     scan_target = Path(project_dir)
-    if scan_target.is_file():
-        scan_target = scan_target.parent
-
+    
     requirements, optional_names, err = get_pipreqs_requirements(str(scan_target))
     if err:
         return [], [], err, None
@@ -2231,8 +2238,6 @@ def get_javascript_dep_entries(
     project_dir: str, binary_path: Optional[str] = None
 ) -> Tuple[List[DepEntry], List[str], Optional[str]]:
     scan_target = Path(project_dir).resolve()
-    if scan_target.is_file():
-        scan_target = scan_target.parent
     
     required_packages = set()
     script_refs = []
@@ -2373,20 +2378,10 @@ def print_master_list(
 
     nested_refs = set(sys_refs) | set(js_refs)
 
-    if not all_entries:
-        if script_type == "Python script":
-            print("  INFO all imported modules are part of the standard library.")
-        elif script_type == "JavaScript script":
-            print("  INFO only built-in Node.js modules used.")
-        else:
-            print("  No dependencies detected.")
-        return 0, [], list(nested_refs)
-
     # 3. Deduplicate and Print the master list
     seen_entries = set()
     unique_entries = []
     for entry in all_entries:
-        # Deduplicate by name and category
         key = (entry.category, entry.name)
         if key not in seen_entries:
             seen_entries.add(key)
@@ -2394,6 +2389,21 @@ def print_master_list(
     
     all_entries = unique_entries
     missing_count = 0
+    
+    # Check if we should print the 'standard library' message
+    has_py_deps = any(e.category in ("py", "py-emb", "python module", "embedded python") for e in all_entries)
+    if not has_py_deps and script_type == "Python script":
+        print("  INFO all imported modules are part of the standard library.")
+    
+    has_js_deps = any(e.category in ("js", "js package") for e in all_entries)
+    if not has_js_deps and script_type == "JavaScript script":
+        print("  INFO only built-in Node.js modules used.")
+
+    if not all_entries:
+        if script_type not in ("Python script", "JavaScript script"):
+            print("  No dependencies detected.")
+        return 0, [], list(nested_refs)
+
     max_cat_len = max((len(f"[{e.category}]") for e in all_entries), default=0)
     
     for entry in all_entries:
