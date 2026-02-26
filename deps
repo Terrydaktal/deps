@@ -185,6 +185,10 @@ POTENTIAL_COMMANDS = {
     "init",
     "ls-files",
     "ls-tree",
+    "./venv/bin/python",
+    "./.venv/bin/python",
+    "venv/bin/python",
+    ".venv/bin/python",
 }
 SYSTEM_FALLBACK_DIRS = (
     "/usr/local/sbin",
@@ -393,6 +397,13 @@ def command_from_token(token: str) -> Optional[str]:
     # Ignore labels or dictionary keys
     if token.endswith(":"):
         return None
+
+    # Detect Docker images: name:tag or registry/name:tag
+    # We ignore tokens with ':' that are not absolute paths and don't exist locally.
+    if ":" in token and not token.startswith("/"):
+        if not os.path.exists(token):
+            return None
+
     if any(ch in token for ch in "\\*?[]{}();|&<>`"):
         return None
     if not VALID_COMMAND_RE.match(token):
@@ -2211,6 +2222,12 @@ def get_python_dep_entries(
                 if req_name is None:
                     continue
                 deduped.setdefault(canonicalize(req_name), req_line)
+
+    if interpreter:
+        # Verify existence of the discovered interpreter
+        full_interp = shutil.which(interpreter) or interpreter
+        if not os.path.exists(full_interp):
+            interpreter = None
 
     if interpreter is None:
         interpreter = find_venv_interpreter(scan_target)
