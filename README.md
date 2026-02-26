@@ -56,7 +56,7 @@ main.py (Python script)
 - **`[bin]`**: System Commands / Executables
 - **`[lib]`**: Shared Libraries (for compiled binaries)
 - **`[py]`**: Python Modules
-- **`[py-ext]`**: Embedded Python code (inside Bash wrappers)
+- **`[py-emb]`**: Embedded Python code (inside Bash wrappers)
 - **`[js]`**: JavaScript / npm Packages
 
 ## How it Works

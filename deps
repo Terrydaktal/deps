@@ -2390,7 +2390,7 @@ def print_master_list(
         if e.category == "python module":
             e.category = "py"
         elif e.category == "embedded python":
-            e.category = "py-ext"
+            e.category = "py-emb"
     all_entries.extend(py_entries)
 
     # JavaScript
