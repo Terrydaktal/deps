@@ -36,7 +36,7 @@ class Style:
 STYLE = Style()
 WRAPPER_COMMANDS = {"sudo", "env",
             "git", "command", "nohup", "time", "git"}
-SHELL_KEYWORDS = {
+ALWAYS_IGNORE = {
     "if",
     "then",
     "elif",
@@ -54,6 +54,13 @@ SHELL_KEYWORDS = {
     "{",
     "}",
     "!",
+    "&&",
+    "||",
+    ";",
+    "|",
+}
+
+POTENTIAL_COMMANDS = {
     "set",
     "export",
     "readonly",
@@ -103,15 +110,10 @@ SHELL_KEYWORDS = {
     "mapfile",
     "times",
     "unset",
-    "local",
-    "readonly",
-    "typeset",
-    "declare",
     "import",
     "from",
     "def",
     "class",
-    "return",
     "yield",
     "None",
     "True",
@@ -501,7 +503,7 @@ def unwrap_shell_command_tokens(tokens: Sequence[str]) -> Optional[Tuple[str, in
             index += 1
             continue
 
-        if token in SHELL_KEYWORDS:
+        if token in ALWAYS_IGNORE:
             return None
 
         return token, index
@@ -516,7 +518,7 @@ def commands_from_shell_segments(command: str) -> Set[str]:
         if not stripped:
             continue
         for command_name in commands_from_shell_string(stripped):
-            if command_name not in SHELL_KEYWORDS:
+            if command_name not in ALWAYS_IGNORE:
                 out.add(command_name)
     return out
 
@@ -856,7 +858,7 @@ def parse_shell_command_dependencies(script_path: str) -> Tuple[List[str], Optio
                 commands.add(variable_cmd)
             else:
                 cmd = command_from_token(command)
-                if cmd is not None and cmd not in SHELL_KEYWORDS:
+                if cmd is not None and cmd not in ALWAYS_IGNORE:
                     commands.add(cmd)
 
         match = heredoc_pattern.search(raw_line)
@@ -1371,6 +1373,27 @@ def print_script_command_deps(script_path: str) -> Tuple[int, int]:
     if not filtered_commands:
         return 0, 0
 
+    # Existence-aware filtering and result collection
+    results: List[Tuple[str, str, str, str]] = []
+    missing = 0
+    for command in filtered_commands:
+        status, path, alternate = resolve_command_dependency(command)
+        
+        # If it's a weak keyword/false-positive candidate and it's missing, ignore it.
+        if status == "missing" and command in POTENTIAL_COMMANDS:
+            continue
+
+        if status == "missing":
+            missing += 1
+        elif status == "expected_missing_present_elsewhere":
+            missing += 1
+        
+        results.append((command, status, path or "", alternate or ""))
+
+    if not results:
+        return 0, 0
+
+    # Finally print headers and results
     print(STYLE.bold(f"System dependencies for {script_path}"))
     print("  INFO target is a script; checking external command dependencies.")
     if len(scanned_scripts) > 1:
@@ -1379,21 +1402,18 @@ def print_script_command_deps(script_path: str) -> Tuple[int, int]:
             preview += f", ... (+{len(scanned_scripts) - 4} more)"
         print(f"  INFO scanned nested scripts: {preview}")
 
-    missing = 0
-    for command in filtered_commands:
-        status, path, alternate = resolve_command_dependency(command)
+    for command, status, path, alternate in results:
         if status == "installed":
             print(f"  {STYLE.green('INSTALLED')} {command} -> {path}")
         elif status == "expected_missing_present_elsewhere":
-            missing += 1
             print(
                 f"  {STYLE.red('MISSING')}   {command} "
                 f"(expected path missing; found elsewhere at {alternate})"
             )
         else:
-            missing += 1
             print(f"  {STYLE.red('MISSING')}   {command}")
-    return missing, len(filtered_commands)
+
+    return missing, len(results)
 
 
 def parse_ldd(output: str) -> List[Tuple[str, Optional[str], bool]]:
@@ -1751,6 +1771,9 @@ def print_python_deps(project_dir: str, binary_path: Optional[str] = None) -> Tu
 
     requirement_lines = list(deduped.values())
     if not requirement_lines:
+        if is_python_script(binary_path or project_dir):
+            print(STYLE.bold(f"\nPython dependencies (pipreqs) for {scan_target.resolve()}"))
+            print("  INFO all imported modules are part of the standard library.")
         return 0, 0
 
     print(STYLE.bold(f"\nPython dependencies (pipreqs) for {scan_target.resolve()}"))
@@ -1800,6 +1823,9 @@ def print_python_deps_only_from_binary(binary_path: str) -> Tuple[int, int]:
         return 1, 0
 
     if not extra_requirements:
+        if is_python_script(binary_path):
+            print(STYLE.bold(f"\nPython dependencies for {binary_path}"))
+            print("  INFO all imported modules are part of the standard library.")
         return 0, 0
 
     print(STYLE.bold(f"\nPython dependencies for {binary_path}"))
@@ -1960,6 +1986,9 @@ def print_javascript_deps(project_dir: str, binary_path: Optional[str] = None) -
         scanned_labels.extend(scanned)
 
     if not required_packages:
+        if is_javascript_script(binary_path or project_dir):
+            print(STYLE.bold(f"\nJavaScript dependencies for {scan_target}"))
+            print("  INFO only built-in Node.js modules used.")
         return 0, 0
 
     print(STYLE.bold(f"\nJavaScript dependencies for {scan_target}"))
