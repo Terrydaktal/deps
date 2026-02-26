@@ -2139,7 +2139,7 @@ def get_system_dep_entries(binary_path: str) -> Tuple[List[DepEntry], List[str],
     ldd_results = parse_ldd(stdout)
     for name, dep_path, installed in ldd_results:
         status = "INSTALLED" if installed else "MISSING"
-        entries.append(DepEntry(category="sys", name=name, status=status, path=dep_path))
+        entries.append(DepEntry(category="lib", name=name, status=status, path=dep_path))
 
     return entries, [], None
 
@@ -2167,10 +2167,10 @@ def get_python_dep_entries(
 
     interpreter = None
     scanned_labels = []
-    category = "python module"
+    category = "py"
 
     if binary_path and has_shebang(binary_path) and not is_python_script(binary_path):
-        category = "embedded python"
+        category = "py-emb"
         extra_requirements, extra_opt, scanned_labels, extra_err, interpreter = collect_script_python_requirements(binary_path)
         if extra_err:
             return [], [], extra_err, interpreter
@@ -2357,30 +2357,18 @@ def print_master_list(
     sys_entries, sys_refs, sys_err = get_system_dep_entries(binary_path)
     if sys_err:
         print(f"  {STYLE.red('ERROR')} system deps: {sys_err}")
-    
-    for e in sys_entries:
-        if e.category == "bin":
-            e.category = "sys"
     all_entries.extend(sys_entries)
 
     # Python
     py_entries, scanned_py, py_err, py_interpreter = get_python_dep_entries(project_target, binary_path)
     if py_err:
         print(f"  {STYLE.red('ERROR')} python deps: {py_err}")
-    
-    for e in py_entries:
-        if e.category == "bin":
-            e.category = "sys"
     all_entries.extend(py_entries)
 
     # JavaScript
     js_entries, js_refs, js_err = get_javascript_dep_entries(project_target, binary_path)
     if js_err:
         print(f"  {STYLE.red('ERROR')} javascript deps: {js_err}")
-    
-    for e in js_entries:
-        if e.category == "bin":
-            e.category = "sys"
     all_entries.extend(js_entries)
 
     nested_refs = set(sys_refs) | set(js_refs)
@@ -2497,13 +2485,13 @@ def main() -> int:
     run_consistency_check(project_target)
 
     print(STYLE.bold("\nSummary"))
-    sys_total = len([e for e in all_collected_entries if e.category in ("sys", "lib")])
-    py_total = len([e for e in all_collected_entries if e.category in ("python module", "embedded python")])
-    js_total = len([e for e in all_collected_entries if e.category in ("js", "js package")])
+    sys_total = len([e for e in all_collected_entries if e.category in ("bin", "lib")])
+    py_total = len([e for e in all_collected_entries if e.category in ("py", "py-emb")])
+    js_total = len([e for e in all_collected_entries if e.category == "js"])
     
-    print(f"  System deps checked: {sys_total}, missing: {len([e for e in all_collected_entries if e.category in ('sys', 'lib') and e.status == 'MISSING'])}")
-    print(f"  Python deps checked: {py_total}, missing: {len([e for e in all_collected_entries if e.category in ('python module', 'embedded python') and e.status == 'MISSING' and not e.optional])}")
-    print(f"  JavaScript deps checked: {js_total}, missing: {len([e for e in all_collected_entries if e.category in ('js', 'js package') and e.status == 'MISSING'])}")
+    print(f"  System deps checked: {sys_total}, missing: {len([e for e in all_collected_entries if e.category in ('bin', 'lib') and e.status == 'MISSING'])}")
+    print(f"  Python deps checked: {py_total}, missing: {len([e for e in all_collected_entries if e.category in ('py', 'py-emb') and e.status == 'MISSING' and not e.optional])}")
+    print(f"  JavaScript deps checked: {js_total}, missing: {len([e for e in all_collected_entries if e.category == 'js' and e.status == 'MISSING'])}")
 
     return 1 if total_missing > 0 else 0
 
