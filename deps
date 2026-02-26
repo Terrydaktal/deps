@@ -2366,6 +2366,13 @@ def print_master_list(
     sys_entries, scanned_scripts, sys_err = get_system_dep_entries(binary_path)
     if sys_err:
         print(f"  {STYLE.red('ERROR')} system deps: {sys_err}")
+    
+    # Precise category tagging
+    for e in sys_entries:
+        if has_shebang(binary_path):
+            e.category = "bin"
+        else:
+            e.category = "lib"
     all_entries.extend(sys_entries)
 
     # Python
@@ -2374,17 +2381,25 @@ def print_master_list(
         py_entries, scanned_py, py_err, py_interpreter = get_python_dep_entries(project_target, binary_path)
     else:
         # Just scan binary for embedded Python (for bash wrappers)
-        # Note: we use get_python_dep_entries with binary_path to trigger embedded logic correctly
         py_entries, scanned_py, py_err, py_interpreter = get_python_dep_entries(project_target, binary_path)
     
     if py_err:
         print(f"  {STYLE.red('ERROR')} python deps: {py_err}")
+    
+    for e in py_entries:
+        if e.category == "python module":
+            e.category = "py"
+        elif e.category == "embedded python":
+            e.category = "py-ext"
     all_entries.extend(py_entries)
 
     # JavaScript
     js_entries, scanned_js, js_err = get_javascript_dep_entries(project_target, binary_path)
     if js_err:
         print(f"  {STYLE.red('ERROR')} javascript deps: {js_err}")
+    
+    for e in js_entries:
+        e.category = "js"
     all_entries.extend(js_entries)
 
     if not all_entries:

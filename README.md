@@ -22,11 +22,8 @@
 
 ### 🐚 System & Shell Robustness
 - **Dynamic Binaries:** Uses `ldd` to map shared library dependencies for compiled executables.
-- **Resilient Shell Parsing:**
-    - Handles complex shell array assignments (e.g., `CMD=(rg --json)`).
-    - Recognizes and skips internal script functions.
-    - Awareness of multi-line quotes (e.g., long `awk` blocks).
-    - Massive ignore list for common shell/awk keywords to minimize false positives.
+- **Existence-Aware Filtering:** Differentiates between structural shell keywords (always ignored) and potential commands (like `commit` or `ninja`). Potential commands are only reported if they actually exist on your system, eliminating noise from git arguments or variable names.
+- **Resilient Shell Parsing:** Handles complex shell array assignments, recognizes script-internal functions, and understands multi-line quotes (e.g. `awk` blocks).
 
 ## Usage
 
@@ -42,26 +39,25 @@
 ./deps --project ~/Dev/my_project crawler.py
 ```
 
-## Output Example
+## Unified Output Format
+
+`deps` provides a consolidated master list per target, categorized by type:
 
 ```text
-System dependencies for /home/lewis/.local/bin/chatbot
-  INSTALLED /bin/chromium -> /usr/bin/chromium
-  INSTALLED bash -> /bin/bash
-  ...
-
-JavaScript dependencies for /home/lewis/Dev/chatbot
-  INSTALLED chalk (^4.1.2) -> .../node_modules/chalk (installed: 4.1.2)
-  INSTALLED commander (^14.0.2) -> .../node_modules/commander (installed: 14.0.2)
-
-Environment Consistency Check
-  OK uv pip check: No broken requirements found.
-
-Summary
-  System deps checked: 22, missing: 0
-  Python deps checked: 0, missing: 0
-  JavaScript deps checked: 9, missing: 0
+main.py (Python script)
+  [bin]           INSTALLED  hd-bet -> /home/lewis/Dev/mri/.venv/bin/hd-bet [via python package: HD_BET]
+  [bin]           INSTALLED  mri_synthstrip -> /home/lewis/Dev/mri/scripts/mri_synthstrip
+  [py]            INSTALLED  nibabel==5.3.3 -> /home/lewis/Dev/mri/.venv/lib/python3.12/site-packages (installed: 5.3.3)
+  [py]            INSTALLED  numpy==2.4.2 -> /home/lewis/Dev/mri/.venv/lib/python3.12/site-packages (installed: 2.4.2)
+  [py]            INSTALLED  SimpleITK==2.5.3 (OPTIONAL) -> ...
 ```
+
+### Category Tags
+- **`[bin]`**: System Commands / Executables
+- **`[lib]`**: Shared Libraries (for compiled binaries)
+- **`[py]`**: Python Modules
+- **`[py-ext]`**: Embedded Python code (inside Bash wrappers)
+- **`[js]`**: JavaScript / npm Packages
 
 ## How it Works
 
@@ -84,4 +80,4 @@ mv deps ~/.local/bin/
 ## Requirements
 - Python 3.10+
 - `pipreqs` (for Python scanning)
-- `shutil`, `ldd`, `nm` (standard on most Linux systems)
+- `shutil`, `ldd` (standard on most Linux systems)
