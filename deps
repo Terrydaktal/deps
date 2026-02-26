@@ -1823,20 +1823,29 @@ def installed_distributions(interpreter_path: Optional[str] = None) -> Dict[str,
     return dist_map
 
 
-def find_venv_interpreter(project_dir: Path) -> Optional[str]:
-    # Check for .venv or venv in the project directory
-    for venv_name in (".venv", "venv"):
-        venv_path = project_dir / venv_name
-        if venv_path.exists() and venv_path.is_dir():
-            # Check common locations for the python binary
-            for bin_dir in ("bin", "Scripts"):
-                # Check for python, python3, python3.x
-                python_bin = venv_path / bin_dir / "python"
-                if python_bin.exists():
-                    return str(python_bin.absolute())
-                python3_bin = venv_path / bin_dir / "python3"
-                if python3_bin.exists():
-                    return str(python3_bin.absolute())
+def find_venv_interpreter(start_path: Path) -> Optional[str]:
+    curr = start_path.resolve()
+    if curr.is_file():
+        curr = curr.parent
+
+    while True:
+        # Check for .venv or venv in the current directory
+        for venv_name in (".venv", "venv"):
+            venv_path = curr / venv_name
+            if venv_path.exists() and venv_path.is_dir():
+                # Check common locations for the python binary
+                for bin_dir in ("bin", "Scripts"):
+                    python_bin = venv_path / bin_dir / "python"
+                    if python_bin.exists():
+                        return str(python_bin.absolute())
+                    python3_bin = venv_path / bin_dir / "python3"
+                    if python3_bin.exists():
+                        return str(python3_bin.absolute())
+        
+        if curr.parent == curr:
+            break
+        curr = curr.parent
+        
     return None
 
 
@@ -2140,25 +2149,6 @@ def print_javascript_deps(project_dir: str, binary_path: Optional[str] = None) -
 def get_system_dep_entries(
     binary_path: str,
 ) -> Tuple[List[DepEntry], List[str], Optional[str]]:
-    p = Path(binary_path)
-    if p.is_dir():
-        all_cmds: Set[str] = set()
-        all_refs: Set[str] = set()
-        for f in p.rglob("*"):
-            # Skip hidden dirs, node_modules, venvs
-            if (
-                any(part.startswith(".") for part in f.parts)
-                or "node_modules" in f.parts
-                or "venv" in f.parts
-            ):
-                continue
-            if f.is_file() and has_shebang(str(f)):
-                cmds, refs, err = collect_script_command_dependencies(str(f))
-                if not err:
-                    all_cmds.update(cmds)
-                    all_refs.update(refs)
-        return resolve_and_map_commands(all_cmds, all_refs, binary_path)
-
     if has_shebang(binary_path):
         return get_script_command_dep_entries(binary_path)
 
@@ -2404,13 +2394,13 @@ def print_master_list(
     all_entries.extend(sys_entries)
 
     # Python
-    py_entries, scanned_py, py_err, py_interpreter = get_python_dep_entries(project_target, binary_path)
+    py_entries, scanned_py, py_err, py_interpreter = get_python_dep_entries(binary_path, binary_path)
     if py_err:
         print(f"  {STYLE.red('ERROR')} python deps: {py_err}")
     all_entries.extend(py_entries)
 
     # JavaScript
-    js_entries, js_refs, js_err = get_javascript_dep_entries(project_target, binary_path)
+    js_entries, js_refs, js_err = get_javascript_dep_entries(binary_path, binary_path)
     if js_err:
         print(f"  {STYLE.red('ERROR')} javascript deps: {js_err}")
     all_entries.extend(js_entries)
@@ -2506,7 +2496,25 @@ def main() -> int:
 
     project_target = args.project if args.project is not None else infer_project_target(initial_binary)
     
-    universe: List[str] = [initial_binary]
+    initial_path = Path(initial_binary)
+    universe: List[str] = []
+    if initial_path.is_dir():
+        for f in sorted(initial_path.rglob("*")):
+            if (
+                any(part.startswith(".") for part in f.parts)
+                or "node_modules" in f.parts
+                or "venv" in f.parts
+            ):
+                continue
+            if f.is_file() and (is_script_file(str(f)) or has_shebang(str(f))):
+                universe.append(str(f))
+        
+        if not universe:
+            print(f"  INFO no scripts found in directory: {initial_binary}")
+            return 0
+    else:
+        universe = [initial_binary]
+
     processed: Set[str] = set()
     all_collected_entries: List[DepEntry] = []
     total_missing = 0
