@@ -2414,6 +2414,31 @@ def print_master_list(
     py_entries, scanned_py, py_err, py_interpreter = get_python_dep_entries(binary_path, binary_path)
     if py_err:
         print(f"  {STYLE.red('ERROR')} python deps: {py_err}")
+    
+    # If we have embedded python, ensure the interpreter is in sys entries
+    if py_interpreter and any(e.category == "py-emb" for e in py_entries):
+        # Check if already present in sys_entries
+        already_present = False
+        interp_name = Path(py_interpreter).name
+        for e in sys_entries:
+            if e.name == py_interpreter or e.name == interp_name:
+                already_present = True
+                break
+        
+        if not already_present:
+            status_key, path, alternate, provider = resolve_command_dependency(
+                py_interpreter, str(Path(binary_path).resolve().parent)
+            )
+            all_entries.append(
+                DepEntry(
+                    category="bin",
+                    name=py_interpreter,
+                    status="INSTALLED" if status_key == "installed" else "MISSING",
+                    path=path or alternate,
+                    provider=provider
+                )
+            )
+
     all_entries.extend(py_entries)
 
     # JavaScript
