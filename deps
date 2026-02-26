@@ -1585,7 +1585,14 @@ def get_pipreqs_requirements(project_dir: str) -> Tuple[Optional[List[str]], Set
     pipreqs_path = shutil.which("pipreqs")
 
     if pipreqs_path:
-        cmd = [pipreqs_path, "--print", "--ignore", ".venv,venv", project_root]
+        cmd = [
+            pipreqs_path,
+            "--print",
+            "--ignore",
+            ".venv,venv",
+            "--no-follow-links",
+            project_root,
+        ]
     else:
         cmd = [
             sys.executable,
@@ -1594,6 +1601,7 @@ def get_pipreqs_requirements(project_dir: str) -> Tuple[Optional[List[str]], Set
             "--print",
             "--ignore",
             ".venv,venv",
+            "--no-follow-links",
             project_root,
         ]
 
