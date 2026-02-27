@@ -2347,6 +2347,17 @@ def get_javascript_dep_entries(
     return entries, script_refs, None
 
 
+def is_python_zipapp(path: str) -> bool:
+    """Detect if a file is a Python Zip Application (zipapp)."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(1024)
+            # ZipApps have a shebang followed by the ZIP signature 'PK\x03\x04'
+            return b"PK\x03\x04" in header and b"python" in header.split(b"\n", 1)[0]
+    except Exception:
+        return False
+
+
 def infer_project_target(binary_path: str) -> str:
     p = Path(binary_path)
     if p.is_dir():
@@ -2384,10 +2395,15 @@ def print_master_list(
 ) -> Tuple[int, List[DepEntry], List[str]]:
     # 1. Detect Script Type for Header
     p = Path(binary_path)
+    is_zipapp = False
     if p.is_dir():
         script_type = "Directory"
     elif is_python_script(binary_path):
-        script_type = "Python script"
+        if is_python_zipapp(binary_path):
+            script_type = "Python ZipApp"
+            is_zipapp = True
+        else:
+            script_type = "Python script"
     elif is_javascript_script(binary_path):
         script_type = "JavaScript script"
     elif has_shebang(binary_path):
@@ -2416,7 +2432,7 @@ def print_master_list(
         print(f"  {STYLE.red('ERROR')} python deps: {py_err}")
     
     # If we have embedded python, ensure the interpreter is in sys entries
-    if py_interpreter and any(e.category == "py-emb" for e in py_entries):
+    if py_interpreter and (is_zipapp or any(e.category == "py-emb" for e in py_entries)):
         # Check if already present in sys_entries
         already_present = False
         interp_name = Path(py_interpreter).name
@@ -2465,6 +2481,8 @@ def print_master_list(
     has_py_deps = any(e.category in ("py", "py-emb") for e in all_entries)
     if not has_py_deps and script_type == "Python script":
         print("  INFO all imported modules are part of the standard library.")
+    elif not has_py_deps and is_zipapp:
+        print("  INFO dependencies for bundled applications are self-contained.")
     
     has_js_deps = any(e.category == "js" for e in all_entries)
     if not has_js_deps and script_type == "JavaScript script":
