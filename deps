@@ -1469,6 +1469,13 @@ def resolve_and_map_commands(
 
     # Process all found commands and script references
     all_potential_cmds = set(commands) | set(script_refs)
+    
+    # Filter out the script itself from its own dependencies
+    abs_base = str(Path(base_path).resolve())
+    all_potential_cmds = {
+        cmd for cmd in all_potential_cmds 
+        if str(Path(cmd).resolve()) != abs_base and cmd != Path(base_path).name
+    }
 
     explicit_paths = {
         cmd
