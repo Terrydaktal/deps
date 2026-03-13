@@ -446,6 +446,86 @@ def shell_split(command: str) -> List[str]:
         return command.split()
 
 
+def scan_shell_command_substitutions(line: str) -> List[Tuple[int, int, str]]:
+    substitutions: List[Tuple[int, int, str]] = []
+    i = 0
+    length = len(line)
+    while i < length - 1:
+        if line[i] != "$" or line[i + 1] != "(":
+            i += 1
+            continue
+
+        # Ignore arithmetic expansion: $(( ... ))
+        if i + 2 < length and line[i + 2] == "(":
+            i += 2
+            continue
+
+        start = i
+        j = i + 2
+        depth = 1
+        in_single = False
+        in_double = False
+        escaped = False
+
+        while j < length:
+            ch = line[j]
+            if escaped:
+                escaped = False
+                j += 1
+                continue
+
+            if ch == "\\" and not in_single:
+                escaped = True
+                j += 1
+                continue
+
+            if ch == "'" and not in_double:
+                in_single = not in_single
+                j += 1
+                continue
+
+            if ch == '"' and not in_single:
+                in_double = not in_double
+                j += 1
+                continue
+
+            if in_single or in_double:
+                j += 1
+                continue
+
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    content = line[i + 2 : j].strip()
+                    if content:
+                        substitutions.append((start, j + 1, content))
+                    i = j + 1
+                    break
+            j += 1
+        else:
+            i += 2
+
+    return substitutions
+
+
+def mask_shell_command_substitutions(
+    line: str, substitutions: Sequence[Tuple[int, int, str]]
+) -> str:
+    if not substitutions:
+        return line
+
+    pieces: List[str] = []
+    cursor = 0
+    for start, end, _ in substitutions:
+        pieces.append(line[cursor:start])
+        pieces.append("$(SUBCMD)")
+        cursor = end
+    pieces.append(line[cursor:])
+    return "".join(pieces)
+
+
 def is_assignment_token(token: str) -> bool:
     return "=" in token and "/" not in token and token.split("=", 1)[0].isidentifier()
 
@@ -846,10 +926,9 @@ def parse_shell_command_dependencies(script_path: str) -> Tuple[List[str], Optio
 
     heredoc_end: Optional[str] = None
     heredoc_pattern = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
-    subcommand_pattern = re.compile(r"\$\(([^)]*)\)")
-    
+
     quote_char: Optional[str] = None
-    
+
     lines = source.splitlines()
     for raw_line in lines:
         stripped = raw_line.strip()
@@ -896,11 +975,13 @@ def parse_shell_command_dependencies(script_path: str) -> Tuple[List[str], Optio
             if parsed_command:
                 variable_commands[var_name] = parsed_command
 
-        for sub_match in subcommand_pattern.finditer(raw_line):
-            commands.update(commands_from_shell_segments(sub_match.group(1)))
+        substitutions = scan_shell_command_substitutions(raw_line)
+        for _, _, content in substitutions:
+            commands.update(commands_from_shell_segments(content))
 
-        tokens = shell_split(stripped)
-        
+        masked_line = mask_shell_command_substitutions(raw_line, substitutions).strip()
+        tokens = shell_split(masked_line)
+
         # Handle assignments with spaces: VAR = CMD
         if len(tokens) >= 3 and tokens[1] == "=":
             # Skip this line as it is an assignment
